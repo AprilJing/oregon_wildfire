@@ -1,0 +1,581 @@
+---
+title: "Oregon average visit rates for saba & asthma emergency data set for metropolitan per month"
+author: "Jingyang Liu"
+date: "April 16, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# knitr options
+knitr::opts_chunk$set(fig.width = 8, fig.height = 6)
+knitr::opts_chunk$set(echo=F, warning=F, message=F)
+```
+
+## Overview
+
+This is for ER asthma claims and saba data set.To check the if the counts are affected by specific month or by MSA.
+
+1. basically making a time-series summary table by month and by MSA
+make summary data table of each metropolitan's each month's visiting number. There are "Bend-Redmond", "Corvallis", "Eugene-Springfield", "Medford", "Portland-Vancouver-Beaverton" and "Salem". We may focus on "Medford" and during the wildfire season's months. (June to August is expected?)  
+(can also explore the possibility of calculating average number of events per person like Sheryl suggested, but Ryan's guess is most people will have 0 events)  
+(We will have inpatient hospitalization and office visit rates during this time in addition to SABA and ER fills)  
+
+2. running Poisson regression. (or check with Quasi-Poisson)
+Then run this as generalized regression model with Poission distribution. But would also consider the family of quasipoisson rather than poisson since Ryan think we might violate the assumption of the poisson regression where mu = variance. And the poisson model indeed has overdispersion.
+
+
+
+### Prepare asthma emergency room visits data set
+
+**Library:**  
+tidyverse is for data cleaning, also includes ggplot and readr.  
+data.table is for quick reading files.  
+htmlTable is for writing table.  
+multcomp is for multiple comparison. Use it for different groups' contrasts in model analysis
+
+```{r library, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(data.table)
+library(htmlTable)
+library(multcomp)
+library(broom)
+# library(contrast)
+```
+
+Then load the data set from saba data set and asthma claims data set. 
+Filter pos of ER and non-missing MSA data set (not in MSA was removed). 
+And import the population for metropolitan in 2013. 20k observations in total.
+
+Use the population table from 
+https://www.census.gov/data/datasets/2017/demo/popest/total-metro-and-micro-statistical-areas.html#tables  
+(The table offers Portland-Vancouver-Hillsboro area population, not separate.)
+
+```{r load ER data set and zip smoke, message=FALSE, warning=FALSE} 
+
+## saba data set
+read_path_ndc <- paste0("../data_new/health/2013_oregon_saba_ndc_claims.csv")
+saba_df <- read_csv(read_path_ndc)
+## asthma data set
+read_path_asthma <- paste0("../data_new/health/2013_oregon_asthma_claims.csv")
+asthma_df <- read_csv(read_path_asthma)
+
+# (https://www.oregonmetro.gov/news/portland-region-grows-235-million-residents-census-estimates-newcomers-leading-way but it lacks the Portland.)
+# read_path_pop <- paste0("../instructions/PEP_2013_PEPANNCHG.US24PR/PEP_2013_PEPANNCHG.US24PR_with_ann.csv")
+# pop_df <- read_csv(read_path_pop) 
+
+## metropolitan population table
+read_path_metro_pop <- paste0("../instructions/cbsa-est2017-alldata.csv")
+metro_pop_df <- read_csv(read_path_metro_pop)
+
+# filter Oregon
+or_metro_pop <- metro_pop_df %>%
+  filter(grepl('OR', metro_pop_df$NAME)) 
+# filter useful variables, remove redundant information
+or_msa_pop <- or_metro_pop %>%
+  filter(grepl('Metropolitan', or_metro_pop$LSAD)) %>%
+  dplyr::select(CBSA, NAME, POPESTIMATE2013) %>% # if not add dplyr, it shows error, maybe conflict with other packages
+  rename(MSA = CBSA)
+
+## filter ER pos
+asthma_er <- asthma_df %>%
+  filter(pos == 23)
+
+# inpatient and office
+# asthma_inp <- asthma_df %>%
+#   filter(pos == 21)
+# asthma_office <- asthma_df %>%
+#   filter(pos == 11)
+
+```
+
+### Prepare SABA data set from ACAP
+
+Saba data set contains most observations (463k observations). Filter the non missing MSA observations. Join with metropolitan's population in 2013. 
+
+The plots show that pharmacy visiting numbers are large on Jan and Oct
+
+From the total visits plot, the Portland have most visits, which can be refered from the population table since it has most population.
+
+For pharmacy in Medford during 2013. June is lowest while July and August shows pretty sharp increase. (and July to August has the sharpest slope, which may indicate the wildfire's effect.)
+
+```{r saba, message=FALSE, warning=FALSE}
+pharmacy_df <- saba_df %>%
+  mutate(age = 2013 - year) %>%
+  mutate(age_cat = case_when(age < 15 ~ "Age < 15",
+                                age >= 15 & age < 65 ~ "Age 15-65",
+                                age >= 65 ~ "Age > 65"),
+              metroarea = case_when(MSA == 13460 ~ "Bend-Redmond",
+                                MSA == 18700 ~ "Corvallis",
+                                MSA == 21660 ~ "Eugene-Springfield",
+                                MSA == 32780 ~ "Medford",
+                                MSA == 38900 ~ "Portland-Vancouver-Beaverton",
+                                MSA == 41420 ~ "Salem")) %>%
+  mutate(month = month(fromdate)) %>%
+  inner_join(or_msa_pop[,c(1,3)], by = "MSA") # 352,150 visits, 131,725 people
+
+# summary(as.factor(total_df$metroarea))
+
+## by MSA and month
+summary_table_pharmacy <- pharmacy_df %>%
+  group_by(MSA, month) %>%
+  summarise(n_visit = n()) %>%
+  inner_join(or_msa_pop, by = "MSA") %>%
+  mutate(rate = n_visit/POPESTIMATE2013*100)
+
+p1 <- ggplot(data = summary_table_pharmacy, aes(x = month, y = n_visit)) +
+  geom_line(aes(color = NAME), size = 1) +
+  geom_point(aes(color = NAME), size = 1) +
+  scale_x_continuous(breaks=c(2,4,6,8,10,12)) +
+  ggtitle("Pharmacy visits during year 2013 in different metropolitan") +
+  xlab("Month") + ylab("Visiting number")
+
+p2 <- ggplot(data = summary_table_pharmacy, aes(x = month, y = n_visit/POPESTIMATE2013)) +
+  geom_line(aes(color = NAME), size = 1) +
+  geom_point(aes(color = NAME), size = 1) +
+  scale_x_continuous(breaks=c(2,4,6,8,10,12)) +
+  ggtitle("Pharmacy visiting rates of population during year 2013 in different metropolitan") +
+  xlab("Month") + ylab("Visiting rates")
+
+```
+
+```{r not for now, echo=FALSE, message=FALSE, warning=FALSE, eval = FALSE, include=FALSE}
+
+summary_table_pharmacy2 <- pharmacy_df %>%
+  group_by(personkey, MSA, month) %>%
+  summarise(n_visit = n()) %>%
+  inner_join(or_msa_pop, by = "MSA") %>%
+  mutate(metroarea = case_when(MSA == 13460 ~ "Bend-Redmond",
+                                MSA == 18700 ~ "Corvallis",
+                                MSA == 21660 ~ "Eugene-Springfield",
+                                MSA == 32780 ~ "Medford",
+                                MSA == 38900 ~ "Portland-Vancouver-Beaverton",
+                                MSA == 41420 ~ "Salem")) %>%
+  select(-NAME) %>% # 274,213 visits, 1306487 are blank
+  data.frame() 
+
+```
+
+```{r message=FALSE, warning=FALSE}
+
+# change the numeric variable as factor
+summary_table_pharmacy$month <- as.factor(summary_table_pharmacy$month)
+summary_table_pharmacy$MSA <- as.factor(summary_table_pharmacy$MSA)
+
+summary_medford <- summary_table_pharmacy %>%
+  filter(MSA == 32780)
+# write_csv(summary_medford, "../data_new/health/medford_summary.csv")
+
+fit2 <- glm(n_visit ~ month, family = poisson, data = summary_medford)
+# summary(fit2)
+
+# htmlTable(summary_table_pharmacy,
+#          header =  paste(c("MSA", "Month", "n_visit", "Name", "Population_2013", "Rate")))
+
+# ggplot(data = summary_medford, aes(x = as.numeric(month), y = n_visit)) +
+#   geom_line(size = 1) +
+#   geom_point(size = 1) +
+#   scale_x_continuous(breaks=c(2,4,6,8,10,12)) +
+#   ggtitle("Pharmacy visits during the year in different metropolitan") +
+#   xlab("Month") + ylab("Visiting number") +
+#   geom_text(aes(label=n_visit), vjust=-0.5)
+
+```
+
+Looking and different counts and rates for asthma ED visits and SABA fills in Oregon by metropolitan statistical area (MSA) and month.   
+Ryan hypothesize that the Douglas-Complex fire that took place in the south-west part of Oregon impacted the MSA of Medford,
+
+```{r message=FALSE, warning=FALSE}
+
+asthma_er_df <- asthma_er %>%
+  mutate(age = 2013 - year) %>%
+  mutate(age_cat = case_when(age < 15 ~ "Age < 15",
+                                age >= 15 & age < 65 ~ "Age 15-65",
+                                age >= 65 ~ "Age > 65"),
+              metroarea = case_when(MSA == 13460 ~ "Bend-Redmond",
+                                MSA == 18700 ~ "Corvallis",
+                                MSA == 21660 ~ "Eugene-Springfield",
+                                MSA == 32780 ~ "Medford",
+                                MSA == 38900 ~ "Portland-Vancouver-Beaverton",
+                                MSA == 41420 ~ "Salem")) %>%
+  mutate(month = month(fromdate)) %>%
+  inner_join(or_msa_pop[,c(1,3)], by = "MSA") # 352,150 visits, 131,725 people
+
+# summary(as.factor(total_df$metroarea))
+
+## by MSA and month
+summary_table_er <- asthma_er_df %>%
+  group_by(MSA, month) %>%
+  summarise(n_visit = n()) %>%
+  inner_join(or_msa_pop, by = "MSA") %>%
+  mutate(rate = n_visit/POPESTIMATE2013*100)
+
+p1 <- ggplot(data = summary_table_er, aes(x = month, y = n_visit)) +
+  geom_line(aes(color = NAME), size = 1) +
+  geom_point(aes(color = NAME), size = 1) +
+  scale_x_continuous(breaks=c(2,4,6,8,10,12)) +
+  ggtitle("Emergency visits during year 2013 in different metropolitan") +
+  xlab("Month") + ylab("Visiting number")
+
+p2 <- ggplot(data = summary_table_er, aes(x = month, y = n_visit/POPESTIMATE2013)) +
+  geom_line(aes(color = NAME), size = 1) +
+  geom_point(aes(color = NAME), size = 1) +
+  scale_x_continuous(breaks=c(2,4,6,8,10,12)) +
+  ggtitle("Emergency visiting rates of population during year 2013 in different metropolitan") +
+  xlab("Month") + ylab("Visiting rates")
+```
+
+
+```{r}
+ed_count <- summary_table_er %>% 
+  rename(n_ed = n_visit) %>% 
+  mutate(rate_per10k = (n_ed/POPESTIMATE2013)*10000,
+         msa_name = gsub('(.*)-.*', '\\1', 
+                      gsub('(.*)-.*', '\\1', gsub('(.*),.*','\\1',NAME))),
+         month_name = factor(month.abb[month], 
+            levels = c("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul",
+                       "Aug", "Sep", "Oct", "Nov", "Dec")))
+# saba counts
+saba_count <- summary_table_pharmacy %>% 
+  rename(n_saba = n_visit) %>% 
+  mutate(rate_per1000 = (n_saba/POPESTIMATE2013)*1000,
+         msa_name = gsub('(.*)-.*', '\\1', 
+                      gsub('(.*)-.*', '\\1', gsub('(.*),.*','\\1',NAME))),
+         month_name = factor(month.abb[month], 
+            levels = c("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul",
+                       "Aug", "Sep", "Oct", "Nov", "Dec")))
+saba_count
+
+```
+
+1. Barchart of SABA counts by MSA by month.
+
+Medford in August has higher visits.
+
+```{r}
+# saba histogram
+saba_bar_plot <- ggplot(saba_count, aes(x = msa_name, group = msa_name,
+                                        fill = msa_name)) +
+  geom_bar(aes(weight = rate_per1000)) +
+  scale_fill_manual("Metro Area", values = c("#3c1053", "#7f00ff", "#e100ff", 
+                                             "#4389a2", "#0ed2f7", "#74ebd5")) +
+  facet_wrap(~month_name) +
+  ylab("SABA Fill Rate per 1,000 Persons") +
+  xlab("Metropolitan Statistical Area") +
+  theme_minimal() +
+  theme(axis.text.x=element_text(angle = 45, hjust = 1))
+
+saba_bar_plot
+```
+
+2. Alternate of month by metro area.
+
+The visiting number is higher in October.
+
+```{r}
+# saba histogram second version
+saba_bar_plot2 <- ggplot(saba_count, aes(x = month_name, group = msa_name,
+                                        fill = msa_name)) +
+  geom_bar(aes(weight = rate_per1000)) +
+  scale_fill_manual("Metro Area", values = c("#3c1053", "#7f00ff", "#e100ff", 
+                                             "#4389a2", "#0ed2f7", "#74ebd5")) +
+  facet_wrap(~msa_name) +
+  ylab("SABA Fill Rate per 1,000 Persons") +
+  xlab("Metropolitan Statistical Area") +
+  theme_minimal() +
+  theme(axis.text.x=element_text(angle = 45, hjust = 1))
+
+saba_bar_plot2
+```
+
+3. Emergency room rates.
+
+Medford has lower visiting number in August.
+
+```{r}
+# saba histogram second version
+er_bar_plot2 <- ggplot(ed_count, aes(x = msa_name, group = msa_name,
+                                        fill = msa_name)) +
+  geom_bar(aes(weight = rate_per10k)) +
+  scale_fill_manual("Metro Area", values = c("#3c1053", "#7f00ff", "#e100ff", 
+                                             "#4389a2", "#0ed2f7", "#74ebd5")) +
+  facet_wrap(~month_name) +
+  ylab("Emergency Room Visits per 10,000 Persons") +
+  xlab("Metropolitan Statistical Area") +
+  theme_minimal() +
+  theme(axis.text.x=element_text(angle = 45, hjust = 1))
+
+er_bar_plot2
+```
+
+
+### 1. SABA visits Interaction model
+
+Research Question:  
+Null hypothesis: There is no difference of visiting number in each MSA during wildfire season (July to August and August to September).  
+Alternative hypothesis: There is difference of visiting number in each MSA during wildfire season (July to August and August to September).   
+Guess for Medford: Jul to Aug will be increase. Aug to Sep will be decrease since smoke occurs most in August.
+
+#### For different MSA:
+The order is Bend, Corvallis, Eugene, Medford, Portland and Salem.  
+contrast statement:     
+1. Each MSA's August visits - This MSA's July visits  
+2. Each MSA's September visits - This MSA's August visits
+
+```{r message=FALSE, warning=FALSE}
+
+summary_table_pharmacy$group <- factor(paste0(summary_table_pharmacy$month, summary_table_pharmacy$NAME))
+X <- model.matrix(~ 0 + group, data=summary_table_pharmacy)
+# colnames(X)
+
+fit <- glm(n_visit ~ 0 + month*NAME, offset = log(POPESTIMATE2013), family = poisson, data = summary_table_pharmacy)
+# summary(fit)
+
+fit_group <- glm(n_visit ~ 0 + group, offset = log(POPESTIMATE2013), family = poisson, data = summary_table_pharmacy)
+# summary(fit_group)
+
+fit_no <- glm(n_visit ~ month + NAME + month:NAME - 1, offset = log(POPESTIMATE2013), family = poisson, data = summary_table_pharmacy)
+# summary(fit_no)
+
+contr_msa_jul_to_sep <- rbind(
+  "Bend: Aug vs Jul" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-1,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0), # 8-7
+  "Bend: Sep vs Aug" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-1,0,0,0,0,0,1,0,0,0,0,0),
+  
+  "Corvallis: Aug vs Jul" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-1,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0), # 8-7
+  "Corvallis: Sep vs Aug" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-1,0,0,0,0,0,1,0,0,0,0), 
+  
+  "Eugene: Aug vs Jul" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-1,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0), # 8-7
+  "Eugene: Sep vs Aug" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-1,0,0,0,0,0,1,0,0,0), 
+  
+  "Medford: Aug vs Jul" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-1,0,0,0,0,0,1,0,0,0,0,0,0,0,0), # 8-7
+  "Medford: Sep vs Aug" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-1,0,0,0,0,0,1,0,0), 
+  
+  "Portland: Aug vs Jul" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-1,0,0,0,0,0,1,0,0,0,0,0,0,0), # 8-7
+  "Portland: Sep vs Aug" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-1,0,0,0,0,0,1,0), 
+
+  "Salem: Aug vs Jul" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-1,0,0,0,0,0,1,0,0,0,0,0,0), # 8-7
+  "Salem: Sep vs Aug" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-1,0,0,0,0,0,1))
+  
+s1 <- glht(fit_group, contr_msa_jul_to_sep)
+summary(s1)
+
+df1 <- as.data.frame(broom::tidy(summary(s1)))
+
+df1 <- df1 %>%
+  dplyr::mutate(lower_ci = estimate - 1.96*std.error,
+         upper_ci = estimate + 1.96*std.error) %>%
+  dplyr::select(lhs, estimate, std.error, lower_ci, upper_ci, p.value) 
+
+df1[-1] <- round(df1[-1], 4)
+  
+htmlTable(df1,
+          caption = "SABA MSA's Visits from July to September",
+          header = c("Contrast", "Estimate", "SE", "Lower", "Upper", "p_value"),
+          # n.rgroup = c(rep(3, 7)), # 6 rows for each age cat for each outcome
+           # column spanner
+           cgroup = c("", "95% CI", ""), 
+           n.cgroup = c(3, 2, 1),
+           padding.rgroup = "&nbsp;&nbsp;",
+           css.cell = "padding-left: 0.5em; padding-right: .5em;", # cell space
+           align = "llcccc")
+```
+
+The result shows:  
+Bend: significant increasing visits during Jul to Aug with exp(0.12) = 1.127 times increasing rate.  
+Corvallis: Not showing difference.  
+Eugene: signigicant decreasing visits during Aug to Sep with 15% decreasing rate.  
+Medford: significant increasing visits during Jul to Aug with 12.7% increasing rate. and signigicant decreasing visits during Aug to Sep with 14% decreasing rate.  
+Portland: signigicant decreasing visits during Aug to Sep with 10.5% decreasing rate.  
+Salem: signigicant decreasing visits during Aug to Sep with 12.7% decreasing rate.
+
+So guess is true. 
+
+#### For August' visits difference in different MSAs
+(although the change rate is more important)
+
+Research Question:  
+Null hypothesis: There is no difference of visiting number between Medford and other MSA in August.   
+Alternative hypothesis: There is difference of visiting number between Medford and other MSA in August.  
+Guess: Since Medford is the wildfire center in August, it may show more visiting number than other MSAs.   
+
+contrast statement:
+Medford's August visits - Other MSA's August visits
+
+```{r}
+contr_aug_msa_medford <- rbind(
+  "Aug: Medford vs Bend" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-1,0,0,1,0,0,0,0,0,0,0,0), 
+  "Aug: Medford vs Corvallis" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-1,0,1,0,0,0,0,0,0,0,0),
+  "Aug: Medford vs Eugene" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-1,1,0,0,0,0,0,0,0,0), 
+  "Aug: Medford vs Portland" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,-1,0,0,0,0,0,0,0),
+  "Aug: Medford vs Salem" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,-1,0,0,0,0,0,0))
+
+s2 <- summary(glht(fit_group, contr_aug_msa_medford))
+summary(s2)
+
+df2 <- as.data.frame(broom::tidy(summary(s2)))
+
+df2 <- df2 %>%
+  dplyr::mutate(lower_ci = estimate - 1.96*std.error,
+         upper_ci = estimate + 1.96*std.error) %>%
+  dplyr::select(lhs, estimate, std.error, lower_ci, upper_ci, p.value) 
+  
+df2[-1] <- round(df2[-1], 4)
+  
+htmlTable(df2,
+          caption = "SABA Medford's Visits vs Other MSA's Visits in August",
+          header = c("Contrast", "Estimate", "SE", "Lower", "Upper", "p_value"),
+          # n.rgroup = c(rep(3, 7)), # 6 rows for each age cat for each outcome
+           # column spanner
+           cgroup = c("", "95% CI", ""), 
+           n.cgroup = c(3, 2, 1),
+           padding.rgroup = "&nbsp;&nbsp;",
+           css.cell = "padding-left: 0.5em; padding-right: .5em;", # cell space
+           align = "llcccc")
+```
+
+The result shows:  
+All Medford's visits in Aug is larger than that in other MSAs. And all are significant except the Salem. 
+For example, the estimate of Medford vs Portland is 0.408, which means: (Medford's visiting rate) / (Portland's visiting rate) is exp(0.408) = 1.5 (actual is 1.007/0.6693) is also 1.5
+
+So guess is basically true.
+
+
+### 2. Emergency Room visits Interaction Model
+
+But the emergency data set shows different rerults with pharmacy data set. 
+
+For Medford, the number in August is pretty small, while in September is pretty large.
+
+#### For different MSA
+
+Research Question:  
+Null hypothesis: There is no difference of visiting number in each MSA during wildfire season (July to August and August to September).  
+Alternative hypothesis: There is difference of visiting number in each MSA during wildfire season (July to August and August to September).   
+
+contrast statement:   
+1. Each MSA's August visits - This MSA's July visits  
+2. Each MSA's September visits - This MSA's August visits
+
+```{r message=FALSE, warning=FALSE}
+
+# change the numeric variable as factor
+summary_table_er$month <- as.factor(summary_table_er$month)
+summary_table_er$MSA <- as.factor(summary_table_er$MSA)
+
+summary_table_er$group <- factor(paste0(summary_table_er$month, summary_table_er$NAME))
+X <- model.matrix(~ 0 + group, data=summary_table_er)
+# colnames(X)
+
+fit <- glm(n_visit ~ 0 + month*NAME, offset = log(POPESTIMATE2013), family = poisson, data = summary_table_er)
+# summary(fit)
+
+fit_group <- glm(n_visit ~ 0 + group, offset = log(POPESTIMATE2013), family = poisson, data = summary_table_er)
+# summary(fit_group)
+
+fit_no <- glm(n_visit ~ month + NAME + month:NAME - 1, offset = log(POPESTIMATE2013), family = poisson, data = summary_table_er)
+# summary(fit_no)
+
+contr_msa_jul_to_sep <- rbind(
+  "Bend: Aug vs Jul" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-1,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0), # 8-7
+  "Bend: Sep vs Aug" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-1,0,0,0,0,0,1,0,0,0,0,0),
+  
+  "Corvallis: Aug vs Jul" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-1,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0), # 8-7
+  "Corvallis: Sep vs Aug" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-1,0,0,0,0,0,1,0,0,0,0), 
+  
+  "Eugene: Aug vs Jul" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-1,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0), # 8-7
+  "Eugene: Sep vs Aug" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-1,0,0,0,0,0,1,0,0,0), 
+  
+  "Medford: Aug vs Jul" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-1,0,0,0,0,0,1,0,0,0,0,0,0,0,0), # 8-7
+  "Medford: Sep vs Aug" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-1,0,0,0,0,0,1,0,0), 
+  
+  "Portland: Aug vs Jul" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-1,0,0,0,0,0,1,0,0,0,0,0,0,0), # 8-7
+  "Portland: Sep vs Aug" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-1,0,0,0,0,0,1,0), 
+
+  "Salem: Aug vs Jul" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-1,0,0,0,0,0,1,0,0,0,0,0,0), # 8-7
+  "Salem: Sep vs Aug" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-1,0,0,0,0,0,1))
+  
+s3 <- summary(glht(fit_group, contr_msa_jul_to_sep))
+summary(s3)
+
+df3 <- as.data.frame(broom::tidy(summary(s3)))
+
+df3 <- df3 %>%
+  dplyr::mutate(lower_ci = estimate - 1.96*std.error,
+         upper_ci = estimate + 1.96*std.error) %>%
+  dplyr::select(lhs, estimate, std.error, lower_ci, upper_ci, p.value) 
+  
+df3[-1] <- round(df3[-1], 4)
+  
+htmlTable(df3,
+          caption = "Asthma ER MSA's Visits from July to September",
+          header = c("Contrast", "Estimate", "SE", "Lower", "Upper", "p_value"),
+          # n.rgroup = c(rep(3, 7)), # 6 rows for each age cat for each outcome
+           # column spanner
+           cgroup = c("", "95% CI", ""), 
+           n.cgroup = c(3, 2, 1),
+           padding.rgroup = "&nbsp;&nbsp;",
+           css.cell = "padding-left: 0.5em; padding-right: .5em;", # cell space
+           align = "llcccc")
+```
+
+The result shows:  
+Bend: significant increasing visits during Aug to Sep with exp(0.12) = 2.27 times increasing rate.  
+Corvallis: Not showing difference.  
+Eugene: significant decreasing visits during Jul to Aug and significant decreasing visits.  
+Medford: significant increasing visits during Aug to Sep. 
+Portland: signigicant incresing visits during Aug to Sep.  
+Salem: signigicant decreasing visits during Aug to Sep with 12.7% decreasing rate.
+
+So this result shows pretty different with SABA data set, especially in Medford, which shows opposite trends.
+
+#### For August' visits difference in different MSAs
+
+Research Question:  
+Null hypothesis: There is no difference of visiting number between Medford and other MSA in August.   
+Alternative hypothesis: There is difference of visiting number between Medford and other MSA in August.  
+Guess: Since Medford is the wildfire center in August, it may show more visiting number than other MSAs. (But ER visits are different from SABA)
+
+contrast statement:
+Medford's August visits - Other MSA's August visits
+
+```{r}
+contr_aug_msa_medford <- rbind(
+  "Aug: Medford vs Bend" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-1,0,0,1,0,0,0,0,0,0,0,0), 
+  "Aug: Medford vs Corvallis" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-1,0,1,0,0,0,0,0,0,0,0),
+  "Aug: Medford vs Eugene" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-1,1,0,0,0,0,0,0,0,0), 
+  "Aug: Medford vs Portland" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,-1,0,0,0,0,0,0,0),
+  "Aug: Medford vs Salem" = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,-1,0,0,0,0,0,0))
+
+s4 <- summary(glht(fit_group, contr_aug_msa_medford))
+summary(s4)
+
+df4 <- as.data.frame(broom::tidy(summary(s4)))
+
+df4 <- df4 %>%
+  dplyr::mutate(lower_ci = estimate - 1.96*std.error,
+         upper_ci = estimate + 1.96*std.error) %>%
+  dplyr::select(lhs, estimate, std.error, lower_ci, upper_ci, p.value) 
+  
+df4[-1] <- round(df4[-1], 4)
+  
+htmlTable(df4,
+          caption = "Asthma ER Medford's Visits vs Other MSA's visits in August",
+          header = c("Contrast", "Estimate", "SE", "Lower", "Upper", "p_value"),
+          # n.rgroup = c(rep(3, 7)), # 6 rows for each age cat for each outcome
+           # column spanner
+           cgroup = c("", "95% CI", ""), 
+           n.cgroup = c(3, 2, 1),
+           padding.rgroup = "&nbsp;&nbsp;",
+           css.cell = "padding-left: 0.5em; padding-right: .5em;", # cell space
+           align = "llcccc")
+           
+```
+
+The result shows:  
+The Medford's visits in August is larger than that in Bend, Corvallis and Portland, but none of them is significant. And it is significantly smaller than that in Eugene and Salem in August.
+
+### Overall
+
+SABA data set shows Medford's visits in August is higher than other MSA while ER visits data set shows that it is not higher.
+
+SABA data set shows Medford's visits in August is higher than than in July and September while ER visits shows the visits in September is higher than that in August.
+
