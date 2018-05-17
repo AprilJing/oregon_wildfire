@@ -1,0 +1,484 @@
+---
+title: "Association between wildfire smoke and asthma claims by place of service"
+author: "Ryan Gan"
+date: '2018-04-16'
+output:
+  html_document:
+    df_print: paged
+editor_options:
+  chunk_output_type: inline
+---
+
+# Introduction
+
+This markdown file follows up on analyses evaluating emergency department (ED) visits and the association between same-day wildfire smoke (WFS) exposure and the association with cardiopulmonary ED claims (proxy for a visit). Since we only observed an association with asthma-related ED visits, we are going to evaluate the impact of WFS exposure on other asthma-related visits and short-acting beta 2 agonist (SABA) fills. The primary aim of these analyses are to help us understand the extent of the impact of WFS on asthma.
+
+```{r setup}
+# libraries
+library(tidyverse) # for ggplot and general data wrangle
+library(survival) # for clogit
+library(dlnm) # set up basis functions
+
+# knitr options
+knitr::opts_chunk$set(fig.width = 8, fig.height = 6)
+```
+
+## Methods
+
+General methods overview. I will offer
+
+### Outcome Definition
+
+In addition to asthma ED visits, we will also evaluate place of service visits for urgent care visits, inpatient visits, outpatient visits, office visits, and ambulance visits. 
+
+First observation over this time period for the patient for visits at a medical facility, but we allow all observations for SABA fills.
+
+We are going to use the same approach of the time-stratified case-crossover design for each event. We will limit the study period and referent period for each event to the wildfire season of May 1^st^, 2013 to September 30^th^, 2013.
+
+```{r cc_list}
+# load asthma casecross place of service list
+load("../../data/health/asthma_cc_pos_list.RData")
+# extract names
+vars_keep <- names(asthma_cc_pos_list[[4]])
+```
+
+Reading in SABA time-stratified case-crossover, cleaning and adding to the asthma casecross list. I've assigned the NDC code to dx1 even though that's not technically what it is.
+
+```{r saba_df}
+saba <- read_csv("../../data/health/2013-oregon_casecross_saba.csv") %>% 
+  rename(identifier = personkey, ZIP = ZIPCODE) %>% 
+  mutate(service_place = "SABA Fill",
+         dx1 = ndc) %>% 
+  # keeping only vars in the other casecrossover dataframes
+  select(vars_keep) %>% 
+  # turn in to list
+  list()
+
+# assign name
+names(saba) <- "saba"
+```
+
+```{r list_subset}
+# adding in age category to each dataframe in list 
+# (i should have done this earlier)
+asthma_pos_list <- c(asthma_cc_pos_list, saba) %>% 
+  map(., function(df){
+    return_df <- df %>% 
+      # remove unknown gender
+      filter(gender != "U") %>% 
+      mutate(age_cat = case_when(age < 15 ~ "Age < 15",
+                                age >= 15 & age < 65 ~ "Age 15-65",
+                                age >= 65 ~ "Age > 65"),
+              metroarea = case_when(MSA == 13460 ~ "Bend-Redmond",
+                                MSA == 18700 ~ "Corvallis",
+                                MSA == 21660 ~ "Eugene-Springfield",
+                                MSA == 32780 ~ "Medford",
+                                MSA == 38900 ~ "Portland-Vancouver-Beaverton",
+                                MSA == 41420 ~ "Salem",
+                                MSA == 41999 ~ "Not in MSA"))
+  })
+
+# removing older list to save some space
+rm(asthma_cc_pos_list)
+```
+
+Estimate the number of observations over the time period.
+
+```{r descriptive_n_percent}
+counts <- asthma_pos_list %>% 
+  map_dfr(., function(df){
+    # subset to outcome observations only
+    out_df <- df %>%
+      filter(outcome == 1) 
+    
+    # place of service
+    service_place <- as.character(unique(df$service_place))
+    
+    # total count
+    n <- out_df %>% 
+      summarise(n = n()) %>% 
+      mutate(strata = "Total") %>% 
+      select(strata, n) 
+    
+    total <- as.numeric(n$n)
+    # sex counts
+    sex_n <- out_df %>% 
+      group_by(gender) %>% 
+      summarise(n = n()) %>% 
+      rename(strata = gender) %>% 
+      mutate(strata = ifelse(strata == "M", "Male", "Female"))
+    # age cat counts
+    age_n <- out_df %>% 
+      group_by(age_cat) %>% 
+      summarise(n = n()) %>% 
+      rename(strata = age_cat) 
+    
+    # bind in rows and spread
+    counts <- bind_rows(n, sex_n, age_n) %>% 
+      mutate(strata = factor(strata, levels = strata)) %>% 
+      spread(strata, n) %>% 
+      cbind(service_place, .) %>% 
+      mutate_at(3:7, funs(perc = round(./Total,3)*100)) %>% 
+      mutate(service_place = as.character(service_place))
+
+  })
+
+# counts of observations; supressing n lower than 20
+n_tab <- counts %>% select(1:7) %>% 
+  mutate_at(2:7, funs(ifelse(. < 20, NA, .)))
+# print n tab
+n_tab
+```
+
+Percentage breakdown of place of service distribution by strata.
+
+```{r percent}
+perc_tab <- counts %>% select(1, 8:12)
+# print n tab
+perc_tab
+```
+
+### PM~2.5~ 
+
+Creating lagged structure just in case.
+
+```{r lag_fun}
+# defining a lag function
+funlag <- function(var, n=6){
+  var <- enquo(var)
+  indices <- seq_len(n)
+  map( indices, ~quo(lag(!!var, !!.x)) ) %>% 
+    set_names(sprintf("%s_lag%d", rlang::quo_text(var), indices))
+}
+```
+
+
+Importing ZIP code population-weighted PM~2.5~ data. 
+
+```{r pm}
+# read in pm2.5
+pm <- read_csv("../../data/pm/2013-oregon_zip_pm25.csv") %>% 
+  # create 10 unit variables
+  mutate(geo_pm10 = geo_wt_pm/10,
+         geo_smk10 = geo_smk_pm/10) %>% 
+  # apply lag function to estimate 5 day lag
+  arrange(ZIPCODE, date) %>% 
+  group_by(ZIPCODE) %>%
+  mutate(., !!!funlag(geo_pm10, 5), !!!funlag(geo_smk10, 5), 
+         !!!funlag(wrf_temp,5)) %>% 
+  rename(ZIP = ZIPCODE)
+```
+
+Joining PM~2.5~ with each dataframe in asthma place of service list.
+
+```{r join_pm}
+asthma_pos_list <- asthma_pos_list %>% 
+  map(., function(df){
+    return_df <- df %>% 
+      # join with pm on date and zip
+      left_join(pm, by = c("date", "ZIP"))
+  })
+```
+
+## Total Same-Day Association with GWR Smoke for All Events
+
+```{r smk_association_all_obs}
+sameday_result <- asthma_pos_list %>% 
+  map_dfr(., function(df){
+    service_place <- as.character(df$service_place[1])
+    # complete case
+    df <- df %>% filter(!is.na(geo_smk10))
+    # model
+    mod <- clogit(outcome ~ geo_smk10 + wrf_temp + strata(identifier), 
+                  data = df)
+    # n events
+    n_events <- mod$nevent
+    # odds ratio and 95% CI
+    estimates <- broom::tidy(mod) %>% 
+      filter(term == "geo_smk10") %>% 
+      select(term, estimate, conf.low, conf.high) %>% 
+      mutate_at(2:4, funs(round(exp(.),3))) %>% 
+      cbind(service_place, n_events, .) %>% 
+      mutate(service_place = as.character(service_place))
+  }) %>% 
+  mutate(strata = "Total") %>% 
+  select(strata, service_place:conf.high)
+
+# table
+sameday_result
+```
+
+## Sex-Specific Same-Day Association 
+
+Feeding in asthma place of service list, applying a series of map functions to first nest the dataframes by sex, then run the clogit model, and finally to extract the results. I think this approach is faster than a loop approach or other methods.
+
+```{r sameday_sex_strata}
+sex_result <- asthma_pos_list %>% 
+  map_dfr(., function(df){
+    service_place <- as.character(df$service_place[1])
+    # complete case
+    sex_df <- df %>% filter(!is.na(geo_smk10)) %>% 
+      # nest strata
+      group_by(gender) %>% 
+      nest() %>% 
+      mutate(model = map(data, ~ clogit(outcome ~ geo_smk10 + wrf_temp +
+                                          strata(identifier), data = .)),
+             est_df = map(model, function(mod){
+                  # n events
+                  n_events <- mod$nevent
+                  # odds ratio and 95% CI
+                  estimates <- broom::tidy(mod) %>% 
+                    filter(term == "geo_smk10") %>% 
+                    select(term, estimate, conf.low, conf.high) %>% 
+                    mutate_at(2:4, funs(round(exp(.),3))) %>% 
+                    cbind(service_place, n_events, .) %>% 
+                    mutate(service_place = as.character(service_place))})) %>% 
+      select(-data, -model) %>% 
+      unnest(est_df)
+  }) %>% 
+  mutate(strata = ifelse(gender == "M", "Male", "Female")) %>% 
+  select(strata, service_place:conf.high)
+
+# table
+sex_result
+```
+
+## Age-Specific Same-Day Association
+
+Repeating the same procedure as above, but for each age category.
+
+```{r age_sameday}
+age_results <- asthma_pos_list %>% 
+  map_dfr(., function(df){
+    service_place <- as.character(df$service_place[1])
+    # complete case
+    sex_df <- df %>% filter(!is.na(geo_smk10)) %>% 
+      # nest strata
+      nest(-age_cat) %>% 
+      mutate(model = map(data, ~ clogit(outcome ~ geo_smk10 + wrf_temp +
+                                          strata(identifier), data = .)),
+             est_df = map(model, function(mod){
+                  # n events
+                  n_events <- mod$nevent
+                  # odds ratio and 95% CI
+                  estimates <- broom::tidy(mod) %>% 
+                    filter(term == "geo_smk10") %>% 
+                    select(term, estimate, conf.low, conf.high) %>% 
+                    mutate_at(2:4, funs(round(exp(.),3))) %>% 
+                    cbind(service_place, n_events, .) %>% 
+                    mutate(service_place = as.character(service_place))})) %>% 
+      select(-data, -model) %>% 
+      unnest(est_df)
+  }) %>% 
+  rename(strata = age_cat) %>% 
+  select(strata, service_place:conf.high) %>% 
+  filter(n_events > 20) %>% 
+  filter(conf.high < 5)
+
+# print table
+age_results
+```
+
+Binding all results together and creating a small-multiples plot.
+
+```{r all_results}
+results <- bind_rows(sameday_result, sex_result, age_results) %>% 
+  rename(odds_ratio = estimate, lower95 = conf.low, upper95 = conf.high) %>% 
+  mutate(strata = case_when(strata == "Total" ~ "All Strata",
+                            TRUE ~ strata),
+         # shorten names of pos
+         service_place = case_when(service_place=="Ambulance-Land"~"Ambulance",
+          service_place == "Emergency Room – Hospital" ~ "Emergency Room",
+          service_place == "Urgent Care Facility" ~ "Urgent Care",
+          TRUE ~ service_place),
+         # set order of strata
+          strata = factor(strata, 
+            levels = c("All Strata", "Female", "Male", "Age < 15", 
+                       "Age 15-65", "Age > 65")),
+    # set order of service place
+          service_place = factor(service_place, 
+            levels = c("SABA Fill", "Office", "Outpatient Hospital", 
+                       "Urgent Care", "Ambulance", "Emergency Room", 
+                       "Inpatient Hospital")))
+```
+
+Plotting results.
+
+```{r plot}
+plot <- ggplot(results, aes(x = strata, y = odds_ratio)) +
+  geom_point(color = "blue") + 
+  geom_errorbar(aes(ymin=lower95, ymax=upper95), color = "blue",width = 0.2) +
+  geom_hline(yintercept = 1, linetype=2) +
+  facet_wrap(~service_place, scales = "free_y") +
+  ylab(expression(paste("Odds Ratio for 10µg/m"^3, " Increase in PM"[2.5]))) +
+  xlab("Stratum") +
+   # plot theme
+    theme(panel.background = element_rect(fill = 'white', colour = 'black'),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    # strip element
+    strip.background = element_rect(colour=NA, fill=NA),
+    panel.border = element_rect(fill = NA, color = "black"),
+    # facet text size
+    strip.text = element_text(size = 10),
+    # axis element (tilt)
+    axis.text.x = element_text(angle = 45, hjust =1),
+    #axis.title.x = element_blank(),
+    #axis.ticks.x = element_blank(),
+    axis.title.y = element_text(angle = 90))
+
+# print plot
+plot
+```
+
+I don't really like this plot because of the wide intervals. I also don't think there is really any evidence of effect modification by strata.
+
+I think I'll just present the all strata estimate.
+
+```{r total_results}
+# filter to total results
+total_results <- results %>% 
+  filter(strata == "All Strata")
+
+# plot total results
+total_plot <- ggplot(total_results, aes(x = service_place, y = odds_ratio, 
+                                        group = service_place)) +
+  geom_point(color = "blue") + 
+  geom_errorbar(aes(ymin=lower95, ymax=upper95), color = "blue",width = 0.2) +
+  geom_hline(yintercept = 1, linetype=2) +
+  ylab(expression(paste("Odds Ratio for 10µg/m"^3, " Increase in PM"[2.5]))) +
+  xlab("Place of Service") +
+   # plot theme
+    theme(panel.background = element_rect(fill = 'white', colour = 'black'),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    # axis element (tilt)
+    axis.text.x = element_text(angle = 45, hjust =1),
+    #axis.title.x = element_blank(),
+    #axis.ticks.x = element_blank(),
+    axis.title.y = element_text(angle = 90))
+
+total_plot
+```
+
+I will probably color-code this. Interesting take-away would be that all types of asthma events were associated with a 10 ug/m^3^ increase in PM~2.5~ we are attributed to smoke. The only events not associated would be urgent care and ambulance visits. However, ambulance visits goes in the direction I'd expect if smoke were to be hazardous. Urgent care shows and inverse association, but it's not associated. SABA fill is any SABA fill, while we only take the first visit for each person, over the time period, which may or may not be appropriate. I can't decide.
+
+## Medford-Specific Results
+
+Limiting to MSA of Medford to see if I see signals with smoke for the specific places of service. I've excluded ambulance and urgent care since their 95% CI CIs were wide, suggesting poor model fits.
+
+```{r medford}
+# excluding ambulance since it won't run for medford
+medford_result <- asthma_pos_list[c(1,3:5,7)] %>% 
+  map_dfr(., function(df){
+    service_place <- as.character(df$service_place[1])
+    # complete case
+    df <- df %>% filter(!is.na(geo_smk10)) %>% 
+      filter(metroarea == "Medford")
+    # model
+    mod <- clogit(outcome ~ geo_smk10 + wrf_temp + strata(identifier), 
+                  data = df)
+    # n events
+    n_events <- mod$nevent
+    # odds ratio and 95% CI
+    estimates <- broom::tidy(mod) %>% 
+      filter(term == "geo_smk10") %>% 
+      select(term, estimate, conf.low, conf.high) %>% 
+      mutate_at(2:4, funs(round(exp(.),3))) %>% 
+      cbind(service_place, n_events, .) %>% 
+      mutate(service_place = as.character(service_place))
+  }) %>% 
+  mutate(strata = "Total") %>% 
+  select(strata, service_place:conf.high) %>% 
+  rename(odds_ratio = estimate, lower95 = conf.low, upper95 = conf.high) %>% 
+  mutate(MSA = "Medford",
+         service_place = case_when(service_place=="Ambulance-Land"~"Ambulance",
+          service_place == "Emergency Room – Hospital" ~ "Emergency Room",
+          TRUE ~ service_place),
+    # set order of service place
+          service_place = factor(service_place, 
+            levels = c("SABA Fill", "Office", "Outpatient Hospital", 
+                       "Emergency Room", "Inpatient Hospital")))
+
+# table
+medford_result
+```
+
+## Other MSAs (not Medford or outside of MSA)
+
+```{r other_msa}
+other_msa_result <- asthma_pos_list[c(1,3:5,7)] %>% 
+  map_dfr(., function(df){
+    service_place <- as.character(df$service_place[1])
+    # complete case
+    df <- df %>% filter(!is.na(geo_smk10)) %>% 
+      filter(metroarea != "Medford") %>% 
+      filter(metroarea != "Not in MSA")
+    # model
+    mod <- clogit(outcome ~ geo_smk10 + wrf_temp + strata(identifier), 
+                  data = df)
+    # n events
+    n_events <- mod$nevent
+    # odds ratio and 95% CI
+    estimates <- broom::tidy(mod) %>% 
+      filter(term == "geo_smk10") %>% 
+      select(term, estimate, conf.low, conf.high) %>% 
+      mutate_at(2:4, funs(round(exp(.),3))) %>% 
+      cbind(service_place, n_events, .) %>% 
+      mutate(service_place = as.character(service_place))
+  }) %>% 
+  mutate(strata = "Total") %>% 
+  select(strata, service_place:conf.high) %>% 
+  rename(odds_ratio = estimate, lower95 = conf.low, upper95 = conf.high) %>% 
+  mutate(MSA = "Other",
+         service_place = case_when(service_place=="Ambulance-Land"~"Ambulance",
+          service_place == "Emergency Room – Hospital" ~ "Emergency Room",
+          TRUE ~ service_place),
+    # set order of service place
+          service_place = factor(service_place, 
+            levels = c("SABA Fill", "Office", "Outpatient Hospital", 
+                       "Emergency Room", "Inpatient Hospital")))
+
+# table
+other_msa_result
+```
+
+## Plot of Same-Day Association by MSA
+
+```{r medford_plot}
+msa_results <- bind_rows(medford_result, other_msa_result)
+# plot total results
+med_plot <- ggplot(msa_results, aes(x = service_place, y = odds_ratio)) +
+  geom_point(color = "purple") + 
+  geom_errorbar(aes(ymin=lower95, ymax=upper95), color = "purple",width = 0.2) +
+  geom_hline(yintercept = 1, linetype=2) +
+  facet_wrap(~MSA) +
+  ylab(expression(paste("Odds Ratio for 10µg/m"^3, " Increase in PM"[2.5]))) +
+  xlab("Place of Service") +
+   # plot theme
+    theme(panel.background = element_rect(fill = 'white', colour = 'black'),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    # strip element
+    strip.background = element_rect(colour=NA, fill=NA),
+    panel.border = element_rect(fill = NA, color = "black"),
+    # facet text size
+    strip.text = element_text(size = 10),
+    # axis element (tilt)
+    axis.text.x = element_text(angle = 45, hjust =1),
+    #axis.title.x = element_blank(),
+    #axis.ticks.x = element_blank(),
+    axis.title.y = element_text(angle = 90))
+
+med_plot
+```
+
+For people who reported living in Medford, I see strong, but small relative increases in the likelihood for a SABA fill and an office visits (and probably inpatient hospitalizations as well). When compared to people living in other MSAs during this period, there is a stronger signal for SABA fills and office visits, but the invervals are much wider even though the number of events is much more than Medford. A couple interesting thoughts: Medford was the only MSA really impacted by smoke during this time, where I'd guess that any signal for other MSAs during this time for smoke are likely because our definition of PM~2.5~ due to smoke is pretty crude as it's just the difference of the daily specific ZIP code estimate minus the estimated seasonal background for that ZIP code. Hence, it's probably picking up some elevated PM~2.5~ days.
+
+## Next Steps/Thoughts
+
+- Have Jingyang focus the comparison of monthly rates by MSA to outcomes of SABA monthly fill rate, office visit, and inpatient visit (this might be interesting).
+
+- Is it worth evaluating a cumulative distributed lag effect of a couple days based on Ana Rappold's new study with CVD?
+
+- Should we try a further refinement of classifying smoke exposure, or even not transform PM~2.5~ and really focus on the Medford vs. other MSAs and just make the argument that any elevated PM~2.5~ during this time in Oregon is likely driven by smoke (particularly in Medford)?

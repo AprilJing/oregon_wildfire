@@ -1,0 +1,238 @@
+---
+title: "Oregon saba casecross sameday association"
+author: "Jingyang Liu"
+date: "December 6, 2017"
+output: html_document
+---
+
+This file runs in local computer. 
+The data set is using the data set of saba ndc casecrossover with smoke (3.9 million observations with 84965 unique person).
+
+First filter the data with non missing geo smoke and mutate the 10-unit smoke PM value. Then filter the data in entire wildfire season and non missing claim id. (For overall claims it can work, but for first visit claim analysis, it shows the length of unique claim id is not equal to the length of people. The reason is some claim id are 0, which are same.) So the data set for analysis does not contain the missing geo smoke and claim id of 0.
+
+The data set loading is 3.93 million observations with 84965 people. After removing the missing values, the data for analysis is 3.87 million observations with 83757 people. 
+
+*Note: When loading the data set of saba ndc casecrossover with smoke with correct outcome, it shows warnings the same as summary stats file, and now it will affect the result for regression analysis. So I use the data set with wrong outcome (all is 1, no 0), which I made before, and mutate the right outcome to data set. This works. I need to correct the data set in the future.*
+
+```{r library, message=FALSE, warning=FALSE, echo=FALSE}
+library(dplyr) 
+library(data.table)
+library(readxl)
+library(readr)
+library(survival)
+library(ggplot2)
+library(knitr)
+```
+
+
+```{r load data, message=FALSE, echo=FALSE}
+# for server
+# read_path <- paste0('../../../data/data_new/health/2013_oregon_saba_ndc_casecross_smk_outcome.csv')
+# saba_casecross_df <- read_csv(read_path) # 3930377 obs, 84965 unique personkey
+
+# for local
+read_path <- paste0('../data_new/health/2013_oregon_saba_ndc_casecross_smk.csv')
+saba_data_df <- read_csv(read_path) # 3930377 obs, 84965 unique personkey
+
+saba_data <- saba_data_df %>% 
+  # filter to complete case for smoke
+  filter(!is.na(geo_smk_pm_zip)) %>% 
+  # create 10 unit smk variable 
+  mutate(geo_smk10 = geo_smk_pm_zip/10) %>% # 3873626
+  filter(clmid != 0) %>% # 3873081
+  mutate(outcome_right = ifelse(date == fromdate, 1, 0)) %>%
+  select(-outcome) %>%
+  rename(outcome = outcome_right) # 3873081
+```
+
+### 1. Total Claims Analysis
+For total claim analysis, we run "exact", "approximate", "efron", "breslow" these four different methods in conditional logistic regression model to check if the results are robust.
+
+*Note: since the time for running is super long, I just run the "exact" method which we want to see in this markdown file; and I use the results from previous running for other three methods, not run the codes here.*
+
+```{r total analysis not run, message=FALSE, warning=FALSE, eval=FALSE, echo=FALSE}
+# fit conditional logistic regression model ----
+mod <- clogit(outcome ~ geo_smk10 + wrf_temp_zip + strata(personkey),
+              data = saba_data)
+
+mod2 <- clogit(outcome ~ geo_smk10 + wrf_temp_zip + strata(personkey),
+              data = saba_data, method=c("approximate"))
+
+mod3 <- clogit(outcome ~ geo_smk10 + wrf_temp_zip + strata(personkey),
+              data = saba_data, method=c("efron"))
+
+mod4 <- clogit(outcome ~ geo_smk10 + wrf_temp_zip + strata(personkey),
+              data = saba_data, method=c("breslow"))
+
+mod_list = list(mod, mod2, mod3, mod4)
+
+mod_table <- data.frame()
+
+mod_table[1:4, 1] = c("Exact", "Approximate", "Efron", "Breslow")
+
+for (i in 1:4){
+
+  mod_table[i, 2] <- round(exp(summary(mod_list[[i]])$coefficient[1,1]), 3) 
+  # 95% lower bound
+  mod_table[i, 3] <- round(exp((summary(mod_list[[i]])$coefficient[1,1]) -
+                         1.96*(summary(mod_list[[i]])$coefficient[1,3])), 3)
+  # 95% upper bound
+  mod_table[i, 4] <- round(exp((summary(mod_list[[i]])$coefficient[1,1]) +
+                         1.96*(summary(mod_list[[i]])$coefficient[1,3])), 3)
+  
+  
+}
+names(mod_table) = c("method", "estimates", "Lower95", "Upper95")
+
+mod_table
+```
+
+```{r total analysis run, message=FALSE, warning=FALSE, echo=FALSE}
+mod <- clogit(outcome ~ geo_smk10 + wrf_temp_zip + strata(personkey),  
+              data = saba_data)
+
+mod_table <- data.frame()
+mod_table[1:4, 1] = c("Exact", "Approximate", "Efron", "Breslow")
+
+mod_table[1, 2] <- round(exp(summary(mod)$coefficient[1,1]), 3) 
+
+# 95% lower bound
+mod_table[1, 3] <- round(exp((summary(mod)$coefficient[1,1]) -
+                         1.96*(summary(mod)$coefficient[1,3])), 3)
+# 95% upper bound
+mod_table[1, 4] <- round(exp((summary(mod)$coefficient[1,1]) +
+                         1.96*(summary(mod)$coefficient[1,3])), 3)
+
+mod_table[2,2:4] <- c(1.054, 1.048, 1.059)
+mod_table[3,2:4] <- c(1.054, 1.049, 1.060)
+mod_table[4,2:4] <- c(1.054, 1.048, 1.059)
+
+names(mod_table) = c("method", "estimates", "Lower95", "Upper95")
+
+knitr:kable(mod_table, caption = "SABA All Claims Odd Ratios with Four Methods")
+
+## previous result
+# Approximate 1.054 1.048 1.059
+# Efron 1.054 1.049 1.060
+# Breslow 1.054 1.048 1.059
+
+# write_path <- paste0("../data_new/health/oregon_saba_estimate.csv")
+# write_csv(mod_table, write_path)
+
+```
+
+
+```{r plot total, message=FALSE, warning=FALSE, echo=FALSE}
+print_plot <- ggplot(mod_table, 
+                     aes(x = method, y = estimates, colour = method)) +
+  
+  geom_errorbar(aes(ymin=Lower95, ymax=Upper95), width = 0.2) +
+  geom_point() + 
+  geom_hline(yintercept = 1, linetype=2) +
+  #    ggtitle('Association Between PM2.5 \n from Wildfire Smoke on Hospitalizations') +
+  ylab(expression(paste("Odds Ratio for 10Âµg/m"^3, " Increase in PM"[2.5]))) +
+  #xlab('Smoke Estimation Method') +
+  # plot theme
+  theme(panel.background = element_rect(fill = 'white', colour = 'black'),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        # strip element
+        strip.background = element_rect(colour=NA, fill=NA),
+        panel.border = element_rect(fill = NA, color = "black"),
+        # facet text size
+        #strip.text = element_text(size = 8),
+        # axis element
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.y = element_text(angle = 90),
+        # legend elements
+        legend.position = "bottom") +
+  #legend.text = element_text(size = 8))
+  ggtitle('Association Between PM2.5 from Wildfire Smoke on 2013 SABA Total Claims')
+
+print(print_plot)
+
+```
+
+### 2. First visit claim analysis
+Then we limit the first visit of each person. (83757 observation of 83757 people)
+
+```{r first visit data set, message=FALSE, warning=FALSE, echo=FALSE}
+saba_first <- saba_data %>%
+    filter(outcome == 1) %>% 
+    group_by(personkey) %>% 
+    arrange(personkey, fromdate, clmid) %>% # all line is 1
+    mutate(num_visit = dense_rank(fromdate)) %>%
+    arrange(personkey, num_visit, clmid) %>% 
+    select(personkey, clmid, num_visit) %>% 
+    unique() %>% 
+    full_join(saba_data, by = c("personkey", "clmid")) %>% 
+    filter(outcome==1) %>%
+    arrange(personkey, fromdate, num_visit, clmid) %>% 
+    filter(row_number() == 1) %>% # 83757 personkey
+  select(personkey, clmid, id) %>%
+  inner_join(saba_data, by = c("personkey", "clmid", "id")) # 1827207 obs
+
+```
+
+
+```{r first visit analysis, message=FALSE, warning=FALSE, echo=FALSE}
+mod_first <- clogit(outcome ~ geo_smk10 + wrf_temp_zip + strata(personkey), 
+                    data = saba_first)
+
+estimate <- round(exp(summary(mod_first)$coefficient[1,1]), 3) # 1.063
+  # 95% lower bound
+lower <- round(exp((summary(mod_first)$coefficient[1,1]) -
+                         1.96*(summary(mod_first)$coefficient[1,3])), 3) # 1.055
+  # 95% upper bound
+upper <- round(exp((summary(mod_first)$coefficient[1,1]) +
+                         1.96*(summary(mod_first)$coefficient[1,3])), 3) # 1.071
+
+mod_first_table <- data.frame()
+mod_first_table[1,1] <- c("Exact")
+mod_first_table[1,2] <- estimate
+mod_first_table[1,3] <- lower
+mod_first_table[1,4] <- upper
+
+
+names(mod_first_table) = c("method", "estimates", "Lower95", "Upper95")
+
+kable(mod_first_table, caption = "SABA First Visit Claim Association")
+
+```
+
+```{r first plot, message=FALSE, warning=FALSE, echo=FALSE}
+print_plot <- ggplot(mod_first_table, 
+                     aes(x = method, y = estimates, colour = method)) +
+  
+  geom_errorbar(aes(ymin=Lower95, ymax=Upper95), width = 0.2) +
+  geom_point() + 
+  geom_hline(yintercept = 1, linetype=2) +
+  #    ggtitle('Association Between PM2.5 \n from Wildfire Smoke on Hospitalizations') +
+  ylab(expression(paste("Odds Ratio for 10Âµg/m"^3, " Increase in PM"[2.5]))) +
+  #xlab('Smoke Estimation Method') +
+  # plot theme
+  theme(panel.background = element_rect(fill = 'white', colour = 'black'),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        # strip element
+        strip.background = element_rect(colour=NA, fill=NA),
+        panel.border = element_rect(fill = NA, color = "black"),
+        # facet text size
+        #strip.text = element_text(size = 8),
+        # axis element
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.y = element_text(angle = 90),
+        # legend elements
+        legend.position = "bottom") +
+  #legend.text = element_text(size = 8))
+  ggtitle('Association Between PM2.5 from Wildfire Smoke on 2013 SABA First Visit Claims')
+
+print(print_plot)
+```
+
+
+From the results above, we can conclude the saba data set of total claims or first visit claim have similar results (about estimate of 1.06 and significant result). So the result is robust.

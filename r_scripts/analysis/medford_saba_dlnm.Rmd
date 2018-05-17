@@ -1,0 +1,215 @@
+---
+title: "Medford SABA Distributed Lag Non-Linear Model"
+author: "Ryan Gan"
+date: "4/18/2018"
+output: html_document
+---
+
+I tried this out in another script. I'm moving it here to clear up clutter there.
+
+```{r setup}
+# libraries
+library(tidyverse) # for ggplot and general data wrangle
+library(survival) # for clogit
+library(dlnm) # set up basis functions
+
+# knitr options
+knitr::opts_chunk$set(fig.width = 8, fig.height = 6)
+```
+
+### PM~2.5~ 
+
+Creating lagged structure just in case.
+
+```{r lag_fun}
+# defining a lag function
+funlag <- function(var, n=6){
+  var <- enquo(var)
+  indices <- seq_len(n)
+  map( indices, ~quo(lag(!!var, !!.x)) ) %>% 
+    set_names(sprintf("%s_lag%d", rlang::quo_text(var), indices))
+}
+```
+
+
+Importing ZIP code population-weighted PM~2.5~ data. 
+
+```{r pm}
+# read in pm2.5
+pm <- read_csv("../../data/pm/2013-oregon_zip_pm25.csv") %>% 
+  # create 10 unit variables
+  mutate(geo_pm10 = geo_wt_pm/10,
+         geo_smk10 = geo_smk_pm/10) %>% 
+  # apply lag function to estimate 5 day lag
+  arrange(ZIPCODE, date) %>% 
+  group_by(ZIPCODE) %>%
+  mutate(., !!!funlag(geo_pm10, 5), !!!funlag(geo_smk10, 5), 
+         !!!funlag(wrf_temp,5)) %>% 
+  rename(ZIP = ZIPCODE)
+```
+
+Reading in SABA time-stratified case-crossover, cleaning and adding to the asthma casecross list. I've assigned the NDC code to dx1 even though that's not technically what it is.
+
+```{r saba_df}
+saba <- read_csv("../../data/health/2013-oregon_casecross_saba.csv") %>% 
+  rename(identifier = personkey, ZIP = ZIPCODE) %>% 
+  filter(gender != "U") %>% 
+  mutate(age_cat = case_when(age < 15 ~ "Age < 15",
+                                age >= 15 & age < 65 ~ "Age 15-65",
+                                age >= 65 ~ "Age > 65"),
+              metroarea = case_when(MSA == 13460 ~ "Bend-Redmond",
+                                MSA == 18700 ~ "Corvallis",
+                                MSA == 21660 ~ "Eugene-Springfield",
+                                MSA == 32780 ~ "Medford",
+                                MSA == 38900 ~ "Portland-Vancouver-Beaverton",
+                                MSA == 41420 ~ "Salem",
+                                MSA == 41999 ~ "Not in MSA")) %>% 
+  left_join(pm, by = c("ZIP", "date")) 
+```
+
+## Non-Linear Distributed Lag
+
+Preparing PM~2.5~ values, assigning an MSA by ZIP code.
+
+```{r pm_msa}
+# making a zipcode and msa key
+zip_msa <- saba %>% 
+  select(MSA, metroarea, ZIP) %>% 
+  unique()
+# ungrouping pm and adding in MSA for color-coding
+pm_msa <- ungroup(pm) %>% 
+  left_join(zip_msa, by = "ZIP") %>% 
+  #filter out missing metroareas
+  filter(!is.na(metroarea))
+# subset medford
+saba_medford <- saba %>% 
+  filter(metroarea == "Medford") %>% 
+  # remove missing values for lag
+  filter(!is.na(geo_pm10_lag5))
+
+rm(saba)
+```
+
+Checking distribution of PM~2.5~ by each ZIP code in each MSA I was able to code. There is a heavy right tail for Medford and ZIPs not in an MSA (which probably capture some rural areas around the southern part of the state. If you let the scales vary, the distribution of PM~2.5~ values suggests to me that Medford was impacted by smoke, as evidenced by the heavy right tail. Other MSAs have distributions that are more like standard distributions for ambient air pollution not impacted by smoke or other extreme events.
+
+```{r pm_dist}
+# distribution of pm values is log-normal
+ggplot(pm_msa, aes(x=geo_wt_pm, group = ZIP, color=metroarea)) +
+  geom_density() +
+  facet_wrap(~metroarea, scales = "free") +
+  theme_minimal()
+```
+
+Looking at time-series of PM~2.5~ values by MSA.I plotted the mean seasonal estimate for each ZIP in each MSA as a red line for each MSA.
+
+```{r pm_ts}
+# estimating seasonal background
+bg_pm <- pm_msa %>% 
+  group_by(date, metroarea) %>% 
+  summarise(mean_pm = mean(background_pm), med_pm = median(background_pm))
+
+# plot
+ggplot(pm_msa, aes(x=date, y=geo_wt_pm, group=ZIP, color = metroarea)) +
+  geom_point() +
+  geom_line(data=bg_pm, aes(x=date, y=mean_pm, group=metroarea), color = "red") +
+  facet_wrap(~metroarea) +
+  theme_minimal()
+```
+
+After looking at these plots, I find it hard to overlook the simple, but limited approach of just subtracting off the difference of the PM~2.5~ estimate from the background estimate.
+
+I'm going to revist the non-linear distributed lag approach. I think we can then estimate a couple different lagged and cumulative effect over a 0 to 5 day prior event period. We could then estimate the function at 10 ug/m^3^ ("normal" air pollution), 20 ug/m^3^ (most likely light smoke), and 30 ug/m^3^ (smoke), and maybe 50 ug/m^3^ (heavy smoke). 
+
+Trying out the distributed lag non-linear package again. I'm going to limit to SABA time-stratified case-crossover dataframe in Medford to simplify.
+
+
+I'm going to use the dlnm package since I don't feel like writing out lines and lines of code to estimate the outer/tensor product of the lagged basis function and the non-linear function of the PM~2.5~ and outcome response. 
+
+```{r pm_lag_mat}
+# extract geo_10 lagged matrix in same order as dataframe
+pm_lag_mat <- saba_medford %>% 
+  select(contains("geo_pm10")) %>% 
+  select(1:5) %>% 
+  as.matrix()
+# view matrix
+head(pm_lag_mat)
+```
+
+Estimating the crossbasis. I'm going to try a 2 knot ns spline for the lag funciton with knots at lag day 2. I will model a 2 degrees of freedom spline for exposure response to PM~2.5~. I also fit a crossbasis for temperature, but the BIC fit suggested just adjusting for wrf_temp was a much better fit.
+
+```{r crossbasis}
+# crossbasis of pm
+cb_pm <- crossbasis(pm_lag_mat, argvar = list(fun="ns", df = 2), lag = 4, 
+                    arglag = list(fun="ns", knots = c(1,3), intercept = T))
+```
+
+Running the conditional logistic regression model with the crossbasis of PM~2.5~ and its prediction of the likelihood of a SABA fill. I found adjusting for temperature on the same day of the event as a linear function has a better fit by BIC compared to a similar temperature cross-basis function that varried the lag function with 2 knots and tried to fit a similar 2-degree natural spline between temperature and SABA fill. 
+
+```{r clogit_mod}
+# clogit model
+cb_mod <- clogit(outcome ~ cb_pm + wrf_temp + strata(identifier), 
+                 data = saba_medford) 
+```
+
+Estimating the exposure/response and lag/response of the relative odds of a SABA fill, given PM~2.5~ exposure. I am centering at 5 ug/m^3^, which is more or less the average/median PM~2.5~ value for Medford over this wildfire season.
+
+```{r crosspred}
+# cross-basis prediction 
+cb_pred <- crosspred(basis = cb_pm, model = cb_mod, cen = 5, at = seq(10,30,5))
+```
+
+Cumulative plot.
+
+```{r cumulative_plot}
+cumulative_plot <- tibble(cb_pred$predvar, cb_pred$allRRfit, cb_pred$allRRlow,
+                          cb_pred$allRRhigh) 
+# col names
+names(cumulative_plot) <- c("pm_var", "odds_ratio", "lower95", "upper95")
+
+ggplot(data=cumulative_plot, aes(x=pm_var, y=odds_ratio)) +
+  geom_point(color = "purple") + 
+  # geom_errorbar(aes(ymin=lower95, ymax=upper95), color = "purple",width = 0.2) +
+  geom_hline(yintercept = 1, linetype=2) 
+
+```
+
+
+Distributed lag plot.
+
+```{r small_multiples_lag_df}
+pm_var <- paste0("PM2.5 = ", cb_pred$predvar)
+
+# odds ratio matrix
+odds_ratio <- as.tibble(cb_pred$matRRfit) %>% 
+  cbind(pm_var, .) %>% 
+  gather(key = "day", value = "odds_ratio", -pm_var)
+# lower 95
+lower95 <- as.tibble(cb_pred$matRRlow) %>% 
+  cbind(pm_var, .) %>% 
+  gather(key = "day", value = "lower95", -pm_var)
+# upper 95
+upper95 <- as.tibble(cb_pred$matRRhigh) %>% 
+  cbind(pm_var, .) %>% 
+  gather(key = "day", value = "upper95", -pm_var)
+# lagged est
+saba_lag_est <- odds_ratio %>% 
+  left_join(lower95, by = c("day", "pm_var")) %>% 
+  left_join(upper95, by = c("day", "pm_var")) %>% 
+  mutate(day = as.numeric(str_sub(day, start=4)))
+
+
+# small-multiples dl plot
+dl_plot <- ggplot(saba_lag_est, aes(x=day, y=odds_ratio)) +
+  geom_line(colour = "#6a3093", size = 1) +
+  geom_ribbon(aes(ymin = lower95, ymax = upper95), 
+              fill = "#6a3093", alpha = 0.5) + 
+  scale_x_continuous(breaks = c(seq(0,7, by=1))) +
+  geom_hline(yintercept = 1, linetype = 2, colour = "red") +
+  facet_wrap(~pm_var, scales = "free_y") +
+  ylab(expression("Odd ratio for lagged effect at specific PM"[2.5])) +
+  xlab("Lagged Days") +
+  theme_minimal()
+
+dl_plot
+```
+

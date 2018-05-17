@@ -1,0 +1,125 @@
+---
+title: "Counts of Asthma ED visits and SABA fills by MSA and Month"
+author: "Ryan Gan"
+date: "2018-05-10"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+
+## Introduction 
+
+Looking and different counts and rates for asthma ED visits and SABA fills in Oregon by metropolitan statistical area (MSA) and month. I hypothesize that the Douglas-Complex fire that took place in the south-west part of Oregon impacted the MSA of Medford, 
+
+
+```{r libraries}
+library(tidyverse)
+```
+
+```{r read_counts}
+# ed counts
+ed_count <- read_csv("../../data/health/msa_month_er_counts.csv") %>% 
+  rename(n_ed = n_visit) %>% 
+  mutate(rate_per10k = (n_ed/POPESTIMATE2013)*10000,
+         msa_name = gsub('(.*)-.*', '\\1', 
+                      gsub('(.*)-.*', '\\1', gsub('(.*),.*','\\1',NAME))),
+         month_name = factor(month.abb[month], 
+            levels = c("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul",
+                       "Aug", "Sep", "Oct", "Nov", "Dec")))
+# saba counts
+saba_count <- read_csv("../../data/health/msa_month_saba_counts.csv") %>% 
+  rename(n_saba = n_visit) %>% 
+  mutate(rate_per1000 = (n_saba/POPESTIMATE2013)*1000,
+         msa_name = gsub('(.*)-.*', '\\1', 
+                      gsub('(.*)-.*', '\\1', gsub('(.*),.*','\\1',NAME))),
+         month_name = factor(month.abb[month], 
+            levels = c("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul",
+                       "Aug", "Sep", "Oct", "Nov", "Dec")))
+saba_count
+```
+
+Barchart of SABA counts by MSA by month.
+
+```{r saba_hist}
+# saba histogram
+saba_bar_plot <- ggplot(saba_count, aes(x = msa_name, group = msa_name,
+                                        fill = msa_name)) +
+  geom_bar(aes(weight = rate_per1000)) +
+  scale_fill_manual("Metro Area", values = c("#3c1053", "#7f00ff", "#e100ff", 
+                                             "#4389a2", "#0ed2f7", "#74ebd5")) +
+  facet_wrap(~month_name) +
+  ylab("SABA Fill Rate per 1,000 Persons") +
+  xlab("Metropolitan Statistical Area") +
+  theme_minimal() +
+  theme(axis.text.x=element_text(angle = 45, hjust = 1))
+
+saba_bar_plot
+```
+
+Alternate of month by metro area.
+
+```{r saba_month_plot}
+# saba histogram second version
+saba_bar_plot2 <- ggplot(saba_count, aes(x = month_name, group = msa_name,
+                                        fill = msa_name)) +
+  geom_bar(aes(weight = rate_per1000)) +
+  scale_fill_manual("Metro Area", values = c("#3c1053", "#7f00ff", "#e100ff", 
+                                             "#4389a2", "#0ed2f7", "#74ebd5")) +
+  facet_wrap(~msa_name) +
+  ylab("SABA Fill Rate per 1,000 Persons") +
+  xlab("Metropolitan Statistical Area") +
+  theme_minimal() +
+  theme(axis.text.x=element_text(angle = 45, hjust = 1))
+
+saba_bar_plot2
+```
+
+Emergency room rates.
+
+```{r er_month_plot}
+# saba histogram second version
+er_bar_plot2 <- ggplot(ed_count, aes(x = msa_name, group = msa_name,
+                                        fill = msa_name)) +
+  geom_bar(aes(weight = rate_per10k)) +
+  scale_fill_manual("Metro Area", values = c("#3c1053", "#7f00ff", "#e100ff", 
+                                             "#4389a2", "#0ed2f7", "#74ebd5")) +
+  facet_wrap(~month_name) +
+  ylab("Emergency Room Visits per 10,000 Persons") +
+  xlab("Metropolitan Statistical Area") +
+  theme_minimal() +
+  theme(axis.text.x=element_text(angle = 45, hjust = 1))
+
+er_bar_plot2
+```
+
+
+SABA Contrasts.
+
+```{r saba_contrast}
+saba_fit <- glm(n_saba ~ 0 + month_name + msa_name + month_name*msa_name +
+                  offset(log(POPESTIMATE2013)), 
+                family = poisson(), data = saba_count)
+
+test <- MASS::glm.nb(n_saba ~ 0 + month_name + msa_name + month_name*msa_name +
+                  offset(log(POPESTIMATE2013)), data = saba_count)
+
+summary(test)
+summary(saba_fit)
+mean(saba_count$rate)
+var(saba_count$rate)
+
+med <- filter(saba_count, msa_name == "Medford")
+
+saba_fit <- glm(n_saba ~ 0 + month_name +
+                  offset(log(POPESTIMATE2013)), 
+                family = quasipoisson(), data = med)
+
+summary(test)
+summary(saba_fit)
+
+MASS::fitdistr(saba_count$n_saba, densfun = "negative binomial")
+qcc::qcc.overdispersion.test(saba_count$n_saba, saba_count$POPESTIMATE2013, "poisson")
+
+?MASS::glm.nb
+```
+

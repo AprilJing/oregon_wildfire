@@ -20,7 +20,7 @@ knitr::opts_chunk$set(fig.width=8, fig.height=6, fig.path='Figs/',
                       echo=FALSE, warning=FALSE, message=FALSE)
 ```
 
-Import CVD data.
+Importing the time-stratified case-crossover dataframes for the cardiovascular endpoints.
 
 ```{r health data import}
 # path for health dataframe
@@ -37,11 +37,13 @@ file_names <- stringr::str_extract(casecross_order,
   pattern="(?<=casecross_)\\w+")
 
 # read in all the files in to a list
-outcome_df_list <- casecross_order %>%  
-  purrr::map(~read_csv(paste0(health_path, .)))
+cvd_over65_list <- casecross_order %>%  
+  purrr::map(~read_csv(paste0(health_path, .))) %>% 
+  # filter to over 65 group
+  purrr::map(~filter(., age >= 65)) 
 
 # name dataframes
-names(outcome_df_list) <- file_names
+names(cvd_over65_list) <- file_names
 
 # name list elements in order I'd like to present in document
 outcome_names <- c("Cardiovascular Disease", "Arrhythmia", 
@@ -51,8 +53,7 @@ outcome_names <- c("Cardiovascular Disease", "Arrhythmia",
 
 Creating a fit function to find the degrees of freedom for the pm spline
 
-```{r custom distributed lag functions}
-
+```{r custom distributed lag fit function}
 # fit function
 dl_fit <- function(data, pm_df, temp_df){
   # i want to remove this part eventually ------
@@ -103,8 +104,10 @@ dl_fit <- function(data, pm_df, temp_df){
     min_df_aic <- subset(pm_df_aic, mod_aic == min(mod_aic))
     return(min_df_aic)
   } # end fit option
+```
 
 
+```{r custom distributed lag function}
 # custom distributed lag function 
 distributed_lag <- function(data, pm_df, temp_df, cumulative=T){
   # i want to remove this part eventually ------
@@ -160,7 +163,7 @@ distributed_lag <- function(data, pm_df, temp_df, cumulative=T){
   # estimate variance of spline
   variance <- pm_b %*% cov_matrix %*% t(pm_b)
   # estimate standard error
-  se <- sqrt(diag(dl_var))
+  se <- sqrt(diag(variance))
   # calculate lower and upper bound
   lower95 <- estimate+(se*qnorm(1-0.975))
   upper95 <- estimate+(se*qnorm(0.975))
@@ -175,7 +178,7 @@ distributed_lag <- function(data, pm_df, temp_df, cumulative=T){
       })
       # stderr cumulative effect
       cumulative_se <- sapply(seq_along(estimate), function(x){
-        sqrt(sum(dl_var[1:x,1:x]))
+        sqrt(sum(variance[1:x,1:x]))
       })
       # cumulative 95CI
       lower95 <- cumulative_estimate+(cumulative_se*qnorm(1-0.975))
@@ -200,23 +203,49 @@ distributed_lag <- function(data, pm_df, temp_df, cumulative=T){
 } 
 ```
 
-## Heart failure in over 65 group
+## Finding smoke distributed lag fit based on AIC
 
-```{r subset data}
-hf65 <- outcome_df_list[[4]] %>% 
-  filter(age_ind == 2)
+This chunk of code uses the dl_fit function I created to find the degrees of freedom for the natural spline that has the lowest AIC for degrees of freem from 2 to 5 for the smoke lag function. I set temperature degrees of freedom to 2. 
 
-cumulative <- distributed_lag(hf65, pm_df = 4, temp_df = 2, cumulative = T)
-cumulative
+```{r smk aic fit}
+fit_df <- cvd_over65_list %>% 
+  purrr::map_df(~dl_fit(., pm_df = c(2:5), temp_df =2)) %>% 
+  cbind(names(cvd_over65_list), .) 
 
+# add degrees of freedom as a slot to the outcomes list
+degfreedom_list <- as.list(fit_df$pm_df)
+
+# dl fit 
+knitr::kable(fit_df, caption = paste0("Smoke natural spline degrees of freedom",
+                                      " knots based on lowest AIC"))
+```
+
+## Distributed Lag Cumulative Effect
+
+Calculating the cumulative effect sequentially (0, 0+1, 0+1+2, ....).
+
+```{r cumulative effect sequential}
+cumulative_cvd <- purrr::map2(.x = cvd_over65_list, .y = degfreedom_list, 
+  ~distributed_lag(data = .x, pm_df = .y, temp_df = 2, cumulative = T)) %>% 
+  plyr::rbind.fill() %>% 
+  bind_cols(., data_frame(rep(outcome_names, each=8))) %>% 
+  rename(outcome_names = `rep(outcome_names, each = 8)`) %>% 
+  select(outcome_names, type, time, estimate, lower95, upper95) %>% 
+  # preserve order of names
+  mutate(outcome_names = parse_factor(outcome_names, levels = outcome_names))
+```
+
+Plotting the cumulative effect of wildfire smoke lags 0 to 7 days for cardiovascular endpoints in persons over 65.
+
+```{r cumulative plot}
 #plot 
-cumulative_plot <- ggplot(cumulative, aes(x=time, y=estimate)) +
+cumulative_plot <- ggplot(cumulative_cvd, aes(x=time, y=estimate)) +
   geom_line(colour = "#046C9A", size = 1) +
   geom_ribbon(aes(ymin = lower95, ymax = upper95), 
               fill = "#ABDDDE", alpha = 0.5) + 
-  scale_y_continuous(limits = c(0.9, 1.25)) +
   scale_x_continuous(breaks = c(seq(0,7, by=1))) +
   geom_hline(yintercept = 1, linetype = 2, colour = "red") +
+  facet_wrap(~outcome_names) +
   ylab(expression("Odd ratio for a 10 ug/m^3 increase smoke PM"[2.5])) +
   xlab("Lagged Days") +
   theme(panel.background = element_rect(fill = 'white', colour = 'black'),
@@ -226,17 +255,31 @@ cumulative_plot <- ggplot(cumulative, aes(x=time, y=estimate)) +
     strip.background = element_rect(colour=NA, fill=NA))
 
 cumulative_plot
+```
 
-dl <- distributed_lag(hf65, pm_df = 3, temp_df = 2, cumulative = F)
-dl
+Estimates of daily distributed lag for CVD outcomes in over 65 age group.
 
-dl_plot <- ggplot(dl, aes(x=time, y=estimate)) +
-  geom_line(colour = "#046C9A", size = 1) +
+```{r distributed lag estimates}
+dl_cvd <- purrr::map2(.x = cvd_over65_list, .y = degfreedom_list, 
+  ~distributed_lag(data = .x, pm_df = .y, temp_df = 2, cumulative = F)) %>% 
+  plyr::rbind.fill() %>% 
+  bind_cols(., data_frame(rep(outcome_names, each=8))) %>% 
+  rename(outcome_names = `rep(outcome_names, each = 8)`) %>% 
+  select(outcome_names, type, time, estimate, lower95, upper95) %>% 
+  # preserve order of names
+  mutate(outcome_names = parse_factor(outcome_names, levels = outcome_names))
+```
+
+Distributed lag plot.
+
+```{r dl plot}
+dl_plot <- ggplot(dl_cvd, aes(x=time, y=estimate)) +
+  geom_line(colour = "#6a3093", size = 1) +
   geom_ribbon(aes(ymin = lower95, ymax = upper95), 
-              fill = "#ABDDDE", alpha = 0.5) + 
-  scale_y_continuous(limits = c(0.9, 1.25)) +
+              fill = "#6a3093", alpha = 0.5) + 
   scale_x_continuous(breaks = c(seq(0,7, by=1))) +
   geom_hline(yintercept = 1, linetype = 2, colour = "red") +
+  facet_wrap(~outcome_names) +
   ylab(expression("Odd ratio for a 10 ug/m^3 increase smoke PM"[2.5])) +
   xlab("Lagged Days") +
   theme(panel.background = element_rect(fill = 'white', colour = 'black'),
@@ -246,55 +289,5 @@ dl_plot <- ggplot(dl, aes(x=time, y=estimate)) +
     strip.background = element_rect(colour=NA, fill=NA))
 
 dl_plot
-
 ```
 
-
-## Myocardial infarction in over 65 group
-
-```{r mi data}
-mi65 <- outcome_df_list[[6]] %>% 
-  filter(age_ind == 2)
-
-cumulative <- distributed_lag(mi65, pm_df = 2, temp_df = 2, cumulative = T)
-cumulative
-
-#plot 
-cumulative_plot <- ggplot(cumulative, aes(x=time, y=estimate)) +
-  geom_line(colour = "#046C9A", size = 1) +
-  geom_ribbon(aes(ymin = lower95, ymax = upper95), 
-              fill = "#ABDDDE", alpha = 0.5) + 
-  scale_y_continuous(limits = c(0.7, 1.2)) +
-  scale_x_continuous(breaks = c(seq(0,7, by=1))) +
-  geom_hline(yintercept = 1, linetype = 2, colour = "red") +
-  ylab(expression("Odd ratio for a 10 ug/m^3 increase smoke PM"[2.5])) +
-  xlab("Lagged Days") +
-  theme(panel.background = element_rect(fill = 'white', colour = 'black'),
-    strip.text = element_text(size = 10),
-    panel.grid.major = element_blank(),
-    panel.grid.minor = element_blank(),
-    strip.background = element_rect(colour=NA, fill=NA))
-
-cumulative_plot
-
-dl <- distributed_lag(mi65, pm_df = 3, temp_df = 2, cumulative = F)
-dl
-
-dl_plot <- ggplot(dl, aes(x=time, y=estimate)) +
-  geom_line(colour = "#046C9A", size = 1) +
-  geom_ribbon(aes(ymin = lower95, ymax = upper95), 
-              fill = "#ABDDDE", alpha = 0.5) + 
-  scale_y_continuous(limits = c(0.9, 1.25)) +
-  scale_x_continuous(breaks = c(seq(0,7, by=1))) +
-  geom_hline(yintercept = 1, linetype = 2, colour = "red") +
-  ylab(expression("Odd ratio for a 10 ug/m^3 increase smoke PM"[2.5])) +
-  xlab("Lagged Days") +
-  theme(panel.background = element_rect(fill = 'white', colour = 'black'),
-    strip.text = element_text(size = 10),
-    panel.grid.major = element_blank(),
-    panel.grid.minor = element_blank(),
-    strip.background = element_rect(colour=NA, fill=NA))
-
-dl_plot
-
-```

@@ -1,0 +1,101 @@
+---
+title: "Example plot for ED visits"
+author: "Ryan Gan"
+date: "4/11/2018"
+output: html_document
+---
+
+
+Tidyverse library for ggplot and readr.
+
+```{r}
+library(tidyverse)
+```
+
+Reading in strata-specific dataframes. Jingyang, you will not need this part since you've already created the dataframes. But you will need to make sure all the variables are the same to bind the rows.
+
+```{r}
+# vector of names of files of table jingyang sent
+files <- stringr::str_subset(list.files("../../data/health/"), "table")
+
+# strata name in same order as files
+strata <- c("age","total", "sex")
+
+# reading in age results
+age_results <- read_csv(paste0("../../data/health/", files[1])) %>% 
+  mutate(strata = case_when(age_cat == 0 ~ "Age < 15",
+                            age_cat == 1 ~ "Age 15-65",
+                            age_cat == 2 ~ "Age > 65"),
+         flag = ifelse(age_cat == 0 & (outcome %in% c("COPD",
+                  "Cardiovascular Disease", "Ischemic Heart Disease", 
+                  "Heart Failure", "Cerebrovascular Disease")), 1, 0)) %>% 
+    # filter out rare events that have unstable ORs
+  filter(flag == 0) %>% 
+  select(outcome, strata, odds_ratio:upper95) 
+
+
+# total strata
+total_results <- read_csv(paste0("../../data/health/", files[2])) %>% 
+  mutate(strata = "All Strata") %>% 
+  select(outcome, strata, odds_ratio:upper95) 
+
+# sex strata
+sex_results <- read_csv(paste0("../../data/health/", files[3])) %>% 
+  mutate(strata = case_when(sex == 0 ~ "Male",
+                            sex == 1 ~ "Female")) %>% 
+  select(outcome, strata, odds_ratio:upper95) 
+
+```
+
+Binding results dataframes together. Removing outcomes I don't want to present, and setting order of outcomes and facet wrap.
+
+```{r}
+# rowbind
+results <- bind_rows(total_results, sex_results, age_results) %>% 
+  # filter to certain outcomes
+  filter(outcome %in% c("All Respiratory", "Asthma", "COPD", 
+                        "Cardiovascular Disease", "Ischemic Heart Disease",
+                        "Heart Failure", "Cerebrovascular Disease")) %>% 
+  # set order of strata levels
+  mutate(outcome = factor(outcome, levels = c("All Respiratory", "Asthma", "COPD", 
+                        "Cardiovascular Disease", "Ischemic Heart Disease",
+                        "Heart Failure", "Cerebrovascular Disease")),
+         strata = factor(strata, levels = c("All Strata", "Female", "Male",
+                                            "Age < 15", "Age 15-65", "Age > 65")),
+         # group cvd and respiratory outcomes
+         Group = as.factor(if_else(outcome %in% c("All Respiratory", "Asthma", "COPD"), 
+                         "Respiratory", "Cardiovascular Disease")))
+```
+
+
+Small-multiples plot.
+
+```{r}
+plot <- ggplot(results, aes(x = outcome, y = odds_ratio, color = Group)) +
+  geom_point() + 
+  geom_errorbar(aes(ymin=lower95, ymax=upper95), width = 0.2) +
+  geom_hline(yintercept = 1, linetype=2) +
+  scale_color_manual(values = c("red", "blue")) +
+  facet_wrap(~strata) +
+  ylab(expression(paste("Odds Ratio for 10µg/m"^3, " Increase in PM"[2.5]))) +
+  xlab("Outcome") +
+   # plot theme
+    theme(panel.background = element_rect(fill = 'white', colour = 'black'),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    # strip element
+    strip.background = element_rect(colour=NA, fill=NA),
+    panel.border = element_rect(fill = NA, color = "black"),
+    # facet text size
+    strip.text = element_text(size = 10),
+    # axis element (tilt)
+    axis.text.x = element_text(angle = 45, hjust =1),
+    #axis.title.x = element_blank(),
+    #axis.ticks.x = element_blank(),
+    axis.title.y = element_text(angle = 90))
+
+# print plot
+plot
+```
+
+I want the plots to look like this. I may change the color scheme, but this is the first set of results. Can you please also save a high-quality image of 300 dpi and maybe 6 inches high by 8 inches wide. 
