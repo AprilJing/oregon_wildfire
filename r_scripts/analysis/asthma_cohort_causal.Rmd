@@ -1,0 +1,165 @@
+---
+title: "Asthma Cohort"
+author: "Ryan Gan"
+date: "12/18/2017"
+output: html_document
+---
+
+### Document Purpose
+
+Descriptive statistics of the assembled asthma cohort. This cohort is made up of all billing records for procedures or pharamacy fills related to cariopulmonary outcomes for anyone in the Oregon APAC data that had been billed for a diagnosis of asthma at any visit in 2013. I have limited the dataframe further to include only asthma related diagnoses claims or SABA fills between May 1, 2013 to September 30, 2013.
+
+```{r setup, echo =F, warning=F, message=F}
+library(tidyverse) # general data wrangle
+library(survival)
+
+# load outcomes vectors
+load("./data/health/outcome_list.RData")
+# subset asthma and saba vector
+asthma_icd9 <- pluck(outcome_icd9_list, "asthma")
+saba_ndc <- pluck(outcome_icd9_list, "saba")
+
+# knitr options
+knitr::opts_chunk$set(fig.width=8, fig.height=6, fig.path='Figs/',
+                      echo=FALSE, warning=FALSE, message=FALSE)
+```
+
+Read in PM~2.5~ data and create binary smoke variables.
+
+Binary smoke variables are based on the following criteria:
+- Geoweighted smoke is the ZIPCODE population-weighted geoweighted ridge-regression estimate of PM~2.5~, subtracting off the background PM ~2.5~ value (period median without smoke in the column). 
+- Smoke0 through Smoke15 indicators are simply a cutoff value of geo_smoke above 0, 5, 10, and 15 ug/m^3. 
+- Smoke Wave indicators are based on Coco Liu's smoke wave, where I've sent the indicator as two days where population-weighted ZIPCODE PM~2.5~ estimated via geoweighted ridge-regression is above the 98th percentile for Oregon over this period (which is roughly 15 ug/m^3).
+
+I just noticed I haves some negative values in the GWR and Krig values, which cannot happen. Need to check in to this. For now, setting values below 0 to 1. It could have happened during the population-weighting.
+
+```{r pm_import}
+# read in pm2.5 data
+pm_path <- "./data/pm/2013-oregon_zip_pm25.csv"
+pm <- read_csv(pm_path) %>% 
+  mutate(ZIPCODE = as.character(ZIPCODE),
+    geo_wt_pm = ifelse(geo_wt_pm < 0, 1, geo_wt_pm),
+  # creating binary smoke indicators 
+    smoke0 = ifelse(geo_smk_pm > 0, 1, 0),
+    smoke5 = ifelse(geo_smk_pm > 5, 1, 0),
+    smoke10 = ifelse(geo_smk_pm > 10, 1, 0),
+    smoke15 = ifelse(geo_smk_pm > 15, 1, 0)) %>% 
+  # create smoke wave (98%tile for 2 days) 
+  group_by(ZIPCODE) %>% 
+  arrange(ZIPCODE, date) %>% 
+  # 98% is 15 in Oregon
+  mutate(high_pm_day = ifelse(geo_wt_pm >= 15, 1, 0),
+    smoke_wave = ifelse(lag(high_pm_day, oreder_by = ZIPCODE)==1 & 
+                        high_pm_day==1, 1, 0))
+```
+
+Read in asthma cohort data. I want to create a cohort that is free for the outcome of interest (starting with ED visit) on 2013-07-15 until 2013-08-30. I want my population to include people at-risk for an asthma an event, but who were free of the outcome (ED visit) for at least 2013-07-01 to 2013-07-15. I will start the time to event at this point. 
+
+```{r cohort_import}
+# read path
+read_path <- "./data/health/2013-oregon_asthma_fireseason_cohort.csv"
+# read in asthma cohort (reading a million rows for now)
+asthma_cohort <- read_csv(read_path, col_types = cols(.default = "c")) %>% 
+  # remove observations without icd9 for now
+  filter(!is.na(dx1)) %>% 
+  mutate(date = as.Date(fromdate, format = "%Y-%m-%d"),
+         age_cat = case_when(age < 15 ~ "age_15_under",
+                             age >= 15 & age < 65 ~ "age_15to65",
+                             age >= 65 ~ "age_65_over")) %>% 
+  rename(ZIPCODE = ZIP) 
+
+# number of observations
+length(unique(asthma_cohort$personkey))
+
+# find the people with an asthma ED visit during the date period 07-01 to 07-15
+remove_ids <- asthma_cohort %>% 
+  # filter to observations 07-01 to 07-15
+  filter(date >= "2013-07-01" & date <= "2013-07-15") %>% 
+  # filter to those with an emergency room visit with asthma
+  filter(pos == "23") %>% 
+  filter(visit_type == "dx_asthma_primary" | 
+         visit_type == "dx_asthma_not_primary") %>% 
+  select(personkey) %>% 
+  unique() 
+  
+remove_id_vec <- as.character(remove_ids$personkey)
+# find primary asthma ed events from 07-16 to 08-30 (event obs)
+ed_outcome <- asthma_cohort %>% 
+  filter(date >= "2013-07-16" & date <= "2013-08-30") %>% 
+  filter(pos ==23 & visit_type == "dx_asthma_primary" & line == 1) %>% 
+  group_by(personkey) %>% 
+  arrange(date) %>% # check that this is really taking the first date
+  # filter to first observation
+  filter(row_number()==1) %>% 
+  ungroup() %>% 
+  # select variables
+  select(personkey, todate, fromdate, dx1, ZIPCODE, visit_type, pos,
+         pos_simple, gender, age, age_cat, yob, date) %>% 
+  mutate(obs_type = "event")
+
+
+# event ids
+ed_event <- ed_outcome %>% select(personkey, fromdate) %>% 
+  rename(censor_date = fromdate) %>% 
+  mutate(outcome = 1,
+         censor_date = as.Date(censor_date))
+
+# create a dataframe with persons in the cohort, but who did not have an event
+# in the previous weeks prior to the study period 
+asthma_at_risk <- asthma_cohort %>% 
+  # remove ids that had an ED visit on that date
+  filter(!(personkey %in% remove_id_vec)) %>% 
+  # now take only one observation per person to get demographic info
+  # i could probably also minimize by closest date to start date
+  group_by(personkey) %>% 
+  arrange(personkey, date) %>% 
+  filter(row_number()==1) %>% 
+  # keep only certain variables
+  select(personkey, todate, fromdate, dx1, ZIPCODE, MSA, visit_type, pos,
+         pos_simple, gender, age, age_cat, yob) %>% 
+  # mutate these variables to indicate first visit is 07-15
+  mutate(date = as.Date("2013-07-15", format = "%Y-%m-%d"),
+         # make a new obs type to indicate outcome of interest or baseline
+         obs_type = "baseline") %>% 
+  # join to censor date
+  left_join(ed_event, by = "personkey") %>% 
+  mutate(censor_date = as.Date(ifelse(is.na(censor_date),
+    as.character("2013-08-30"), as.character(censor_date))),
+         outcome = ifelse(is.na(outcome), 0, outcome),
+    time_diff = censor_date - date)
+
+glimpse(asthma_cohort)
+
+# summary of the number of smoke days for a given zipcode 
+smk_data <- pm %>% 
+  group_by(ZIPCODE) %>% 
+  summarise(n_smk0 = sum(smoke0), n_smk5 = sum(smoke5), n_smk10 = sum(smoke10),
+            n_smk15 = sum(smoke15), n_smk_wave = sum(smoke_wave))
+
+asthma_smk <- asthma_at_risk %>% 
+  left_join(smk_data, by = "ZIPCODE") %>% 
+  filter(!is.na(n_smk_wave))
+
+
+summary(asthma_smk$n_smk_wave)
+
+asthma_smk_summary <- asthma_smk %>% 
+  group_by(n_smk_wave) %>% 
+  summarize(n_obs = n(), mean_time = mean(time_diff), 
+            median_time = median(time_diff))
+
+
+ggplot(pm, aes(x=date, y=geo_wt_pm)) +
+  geom_point() +
+  geom_hline(yintercept = 15, color = "red")
+
+?geom_hline
+```
+
+
+
+
+
+
+
+

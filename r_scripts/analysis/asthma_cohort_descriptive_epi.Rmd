@@ -1,0 +1,293 @@
+---
+title: "Asthma Cohort Descriptive Epidemiology"
+author: "Ryan Gan"
+date: "2017-12-06"
+output: html_document
+---
+
+### Document Purpose
+
+Descriptive statistics of the assembled asthma cohort. This cohort is made up of all billing records for procedures or pharamacy fills related to cariopulmonary outcomes for anyone in the Oregon APAC data that had been billed for a diagnosis of asthma at any visit in 2013.
+
+```{r setup, echo =F, warning=F, message=F}
+library(tidyverse) # general data wrangle
+
+# load outcomes vectors
+load("../../data/health/outcome_list.RData")
+# subset asthma and saba vector
+asthma_icd9 <- pluck(outcome_icd9_list, "asthma")
+saba_ndc <- pluck(outcome_icd9_list, "saba")
+
+# read in place of service csv file
+place_of_service <- read_csv("../../data/health/2013-oregon_pos.csv")
+
+# knitr options
+knitr::opts_chunk$set(fig.width=8, fig.height=6, fig.path='Figs/',
+                      echo=FALSE, warning=FALSE, message=FALSE)
+```
+
+Read cohort dataset (reading in a small chunk for now.)
+
+```{r cohort_import}
+# read path
+read_path <- "../../data/health/2013-oregon_asthma_cohort.csv"
+# read in asthma cohort (reading a million rows for now)
+asthma_cohort <- data.table::fread(read_path, 
+  # read options
+  header = T, #nrows = 10000, # removing nrows read 
+  colClasses = rep("character", 72)) %>% 
+  # filter to oregon
+  filter(STATE == "OR") %>% 
+  # replace *NULL* with NA
+  mutate_all(funs(replace(., .== "*NULL*" | . == "", NA))) %>% 
+  # create visit type indicator 
+  mutate(visit_type = as.factor(
+    case_when((dx1 %in% asthma_icd9) ~ "dx_asthma_primary",
+    # asthma but not as a primary
+    !(dx1 %in% asthma_icd9) & (dx2 %in% asthma_icd9 | dx3 %in% asthma_icd9 | 
+      dx4 %in% asthma_icd9 | dx5 %in% asthma_icd9 | dx6 %in% asthma_icd9 | 
+      dx7 %in% asthma_icd9 | dx8 %in% asthma_icd9 | dx9 %in% asthma_icd9 | 
+      dx10 %in% asthma_icd9 | dx11 %in% asthma_icd9 | dx12 %in% asthma_icd9 | 
+      dx13 %in% asthma_icd9) ~ "dx_asthma_not_primary",
+    # other dx 
+    !(dx1 %in% asthma_icd9 | dx2 %in% asthma_icd9 | dx3 %in% asthma_icd9 | 
+      dx4 %in% asthma_icd9 | dx5 %in% asthma_icd9 | dx6 %in% asthma_icd9 | 
+      dx7 %in% asthma_icd9 | dx8 %in% asthma_icd9 | dx9 %in% asthma_icd9 | 
+      dx10 %in% asthma_icd9 | dx11 %in% asthma_icd9 | dx12 %in% asthma_icd9 | 
+      dx13 %in% asthma_icd9) & is.na(ndc) ~ "dx_other",
+    # ndc code
+    (ndc %in% saba_ndc) ~ "pharm_saba",
+    !is.na(ndc) & !(ndc %in% saba_ndc) ~ "pharm_other")),
+    # adding names of metro area
+    metroarea = case_when(
+      MSA == 13460 ~ "Bend-Redmond",
+      MSA == 18700 ~ "Corvallis",
+      MSA == 21660 ~ "Eugene-Springfield",
+      MSA == 32780 ~ "Medford",
+      MSA == 38900 ~ "Portland-Vancouver-Beaverton",
+      MSA == 41420 ~ "Salem",
+      MSA == 41999 ~ "Not in MSA"),
+    los = as.numeric(los),
+         # create age variable
+         age = 2013 - as.numeric(yob),
+         # code in race text to numeric race
+         race_factor = case_when(race == 1 ~ "White",
+                                 race == 2 ~ "Black",
+                                 race == 3 ~ "American Indian",
+                                 race == 4 ~ "Asian",
+                                 race == 5 ~ "Pacific Islander",
+                                 race == 6 ~ "Other", 
+                                 race == 7 ~ "Two or more",
+                                 race == 9 ~ "Unknown"),
+         ethnicity = case_when(ethn == "1" ~ "Hispanic",
+                               ethn == "2" ~ "Not Hispanic",
+                               ethn == "3" ~ "Unknown")) %>% 
+  # convert date variables to dates
+  mutate_at(vars(contains("date")), funs(as.Date(.,format="%Y-%m-%d"))) %>%
+  # join in place of service text
+  left_join(place_of_service, by = "pos") %>% 
+  # simpler place of service grouping
+  mutate(pos_simple = as.factor(case_when(pos == "01" ~ "Pharmacy",
+    pos == "03" ~ "School",
+    pos == "11" ~ "Office",
+    pos == "20" ~ "Urgent Care", 
+    pos == "21" ~ "Inpatient Hospital",
+    pos == "22" ~ "Outpatient Hospital",
+    pos == "23" ~ "Emergency Room Hospital",
+    pos == "41" | pos == "42" ~ "Ambulance",
+    pos == "71" | pos == "72" ~ "Public Health Clinic",
+    pos == "49" ~ "Independent Clinic", 
+    TRUE ~ "Other"))) %>% 
+  # filter todate to 2013 to avoid some weird issues with dates
+  filter(todate >= "2013-01-01" & todate <= "2013-12-31")
+
+
+```
+
+### Observation Types
+
+Description of number of observation types. I have not yet characterized the individuals; these are summaries of all observations. I've categorized observations in the previous step in to five categories as follows: 
+- dx_asthma_primary: This is an observation where I've identified a medical procedure in the primary dx category that is a ICD-9 code of asthma. 
+- dx_asthma_not_primary: This is an observation where the primary medical procedure is not asthma, but at least one other medical procedure was for asthma.
+- dx_other: This is an observation that is a medical procedure, but the primary or any other procedure was not asthma.
+- pharm_saba: This ia an observation where a short-acting beta-2 agonist (SABA) prescription was billed
+
+```{r vis_type_summary}
+visit_type_summary <- asthma_cohort %>% 
+  group_by(visit_type) %>% 
+  summarise(n = n()) %>% 
+  mutate(percent = round((n/nrow(asthma_cohort)),3)*100)
+
+# kable table
+knitr::kable(visit_type_summary, caption = paste0("Visit type number and",
+                                                  " percentage."))
+```
+
+It appears that only a small percentage of visits for persons identified to have asthma were billed for asthma procedures. Same goes for pharmacy fills. 
+
+#### Place of Service
+
+Evaluating the number of observations and percentages for place of service. Here is a table of all the places of service. A good majority of serv ices take place in the "office" location, which is a location where health professionals provide health care (Drs'. Office). 
+
+```{r service_table}
+n_pos <- asthma_cohort %>% 
+  group_by(service_place) %>% 
+  summarise(n = n()) %>% 
+  mutate(percent = round((n/nrow(asthma_cohort)),3)*100)
+
+knitr::kable(n_pos, caption="Place of service look-up table")
+```
+
+There are a lot of visit types that will rarely be coded and won't be informative to us, so I've grouped them up on what I think would be a reasonable representation of major places of visits relevant to the study question. I've limited to a subset of places of services and grouped some together, but I'm open to discussion. I've removed the pharmacy records for this plot since the place of service is just pharmacy and it's not informative.
+
+```{r pos_visit_type}
+pos_visit_type <- asthma_cohort %>% 
+  group_by(pos_simple, visit_type) %>% 
+  summarise(n_obs = n()) %>% 
+  left_join(select(visit_type_summary, -percent), by = "visit_type") %>% 
+  mutate(percent = round(n_obs/n, 3)*100) %>% 
+  filter(visit_type != "pharm_saba" & visit_type != "pharm_other")
+
+plot <- ggplot(pos_visit_type, aes(x=pos_simple, y=percent)) +
+  geom_col(fill="#355c7d") +
+  facet_wrap(~visit_type) +
+  theme_bw()+
+  theme(axis.text.x=element_text(angle=90,hjust=1, vjust=0.5))
+
+plot
+```
+
+#### Distribution of Dates 
+
+Plotting the date distributions by visit type. Looks like multimodal distributions of visits types by date, where asthma as a primary or not primary has peaks in spring and fall. Same with SABA fills.
+```{r vis_type_date}
+plot <- ggplot(asthma_cohort, aes(x=todate)) +
+  geom_density(color = "#19547b") +
+  facet_wrap(~visit_type) + 
+  theme_minimal()
+
+plot
+```
+
+#### Length of Stay
+Plotting the length of stay. Pharmacy fills do not have any distribution of length of stay, but it was easier to just plot it then remove it :). Heavy right-skew for all diagnosis types. This is likely elderly people in places of service where they may actually stay for the year. It could also be an error. But most stays are no more than a month. This would change depending on age or place of service.
+
+```{r vis_type_los}
+plot <- ggplot(asthma_cohort, aes(x=los)) +
+  geom_density(color = "#19547b") +
+  facet_wrap(~visit_type) + 
+  theme_minimal()
+
+plot
+```
+
+### Individual-Level Descriptives
+
+#### Unique Persons
+
+As this is a cohort of persons that were identified to have a diagnosis of asthma, I'd like to know a little more about them as a group. First step is to count up the number of unique persons. First is a count of unique personkey ids, which represents the number of unique persons in this cohort.
+
+```{r n_persons}
+# length of unique person ids
+n_persons <- length(unique(asthma_cohort$personkey))
+# represents the number of persons
+n_persons
+```
+
+Summary statistics and distribution of visit type per person. Includes both pharmacy fills and medical visits, so the distribution will be right-skewed.
+
+```{r summary_persons}
+person_obs <- asthma_cohort %>% 
+  group_by(personkey, visit_type) %>% 
+  summarise(n_obs = n())
+
+summary_type <- person_obs %>% 
+  group_by(visit_type) %>% 
+  summarise(n = n(), mean_n = mean(n_obs), median_n = median(n_obs), 
+            min_n = min(n_obs), max_n = max(n_obs))
+
+# table of summary types
+knitr::kable(summary_type, caption = "Summary of observations by visit type.")
+```
+
+Plot of observation number distribution by visit type.
+```{r obs_dist_plot}
+plot <- ggplot(person_obs, aes(x=n_obs)) +
+  geom_density(color = "#19547b") +
+  facet_wrap(~visit_type, scales = "free_x") +
+  theme_minimal()
+plot
+```
+
+#### Age Distribution
+
+To understand the distribution of demographic factors, I'm going to subset the first (by date) diagnosis of asthma visit observed to look at age, gender, and race/ethnicity distributions. When you subset out the NDC and other diagnoses types, the cohort is reduced drastically. I believe this would be fine and actually create a more well-defined cohort if it's subsetted to just asthma.
+
+Here is a count of number of persons with either a primary or other diagnosis of asthma in the cohort dataset. 
+```{r age_n}
+asthma_demographic <- asthma_cohort %>% 
+  filter(visit_type == "dx_asthma_primary" | 
+         visit_type == "dx_asthma_not_primary") %>% 
+  group_by(personkey) %>% 
+  arrange(todate) %>% 
+  filter(row_number()==1)
+
+nrow(asthma_demographic)
+```
+
+Summary statistics of age in persons with a medical visit related to asthma.
+```{r age_sum}
+summary(asthma_demographic$age)
+```
+
+Age distribution plot in persons with a medical visit related to asthma..
+```{r age_dist}
+# asthma age distribution plot
+plot <- ggplot(asthma_demographic, aes(x=age)) +
+  geom_density(color = "#19547b") +
+  theme_minimal()
+plot
+```
+
+#### Gender Distribution
+
+Gender n and percentage.
+```{r gender_stat}
+# count
+xtabs(~gender, asthma_demographic) 
+# percentage
+round(prop.table(xtabs(~gender, asthma_demographic)),3)*100
+```
+
+#### Race/Ethnicity Distribution
+
+Race n and percentage. A lot of persons did not report race.
+```{r race_stat}
+xtabs(~race_factor, asthma_demographic)
+round(prop.table(xtabs(~race_factor, asthma_demographic)),3)*100
+```
+
+Ethnicity n and percentage. Same deal. A lot of persons did not report ethnicity.
+```{r ethn_stat}
+xtabs(~ethnicity, asthma_demographic)
+round(prop.table(xtabs(~ethnicity, asthma_demographic)),3)*100
+```
+
+#### Metropolitan Statistical Area
+
+MSA n and percentage.
+```{r msa}
+xtabs(~metroarea, asthma_demographic)
+round(prop.table(xtabs(~metroarea, asthma_demographic)),3)*100
+```
+
+### Conclusions
+
+Overall, I think this cohort approach could work.I think the observations that are dx_other or pharm_other make the dataset too large, and may have no practical value for the analyses I'm considering. But they are probably worth retaining for now. 
+
+Some ideas are we could further limit the study population to those with at least 2 visits of asthma to further increase our specificity that a person has asthma. We could then look at the range of severity of outcomes in these people, where the most severe would be an inpatient hospital stay for a primary diagnosis of asthma. Second-most severe could be an ER/urgent care admission or ambulance visit. Least-severe could be a SABA fill in a cohort time-to-event manner. I was thinking we could start time at either the start of the wildfire period or July, and could include people who have asthma dx for some time that year, but have been without a medical bill for at least a month prior to start of study date.
+
+For this cohort approach, I'd like to try out VanderWeele's E-value measure, which estimates the impact unmeasured confounders would have to have to explain the association. 
+
+We could also look at time-series and case-cross over study designs too like Sheryl suggested. I think this is a good idea too, and hopefully these results would agree with our general hypotheses that smoke is bad.
+

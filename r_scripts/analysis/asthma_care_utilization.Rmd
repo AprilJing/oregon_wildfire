@@ -1,0 +1,237 @@
+---
+title: "Multiple visits in persons likely to have asthma"
+author: "Ryan Gan"
+date: "1/9/2018"
+output: html_document
+---
+
+## Document Purpose
+
+This document attempts to describe utilization of healthcare in persons who are likely to have asthma. It will eventually see if wildfire smoke may influence utilization.
+
+## Setup
+
+First step is to read in the persons with asthma in the fireseason. I may end up doing this for the entire year, but that dataset is much larger and would take a bit.
+
+```{r setup, echo = F, warning = F, message = F}
+# libraries.
+library(tidyverse)
+library(lme4)
+
+# knitr options
+knitr::opts_chunk$set(fig.width=8, fig.height=6, 
+                      warning=FALSE, message=FALSE)
+```
+
+Reading in ZIP population-weighted smoke data and joining to ZIPCODE of persons.
+
+```{r smoke_import_wrangle}
+# read in pm2.5 data
+pm_path <- "../../data/pm/2013-oregon_zip_pm25.csv"
+
+pm <- read_csv(pm_path) %>% 
+  mutate(ZIPCODE = as.character(ZIPCODE),
+    geo_wt_pm = ifelse(geo_wt_pm < 0, 1, geo_wt_pm),
+  # creating binary smoke indicators 
+    smoke0 = ifelse(geo_smk_pm > 0, 1, 0),
+    smoke5 = ifelse(geo_smk_pm > 5, 1, 0),
+    smoke10 = ifelse(geo_smk_pm > 10, 1, 0),
+    smoke15 = ifelse(geo_smk_pm > 15, 1, 0)) %>% 
+  # create smoke wave (98%tile for 2 days) 
+  group_by(ZIPCODE) %>% 
+  arrange(ZIPCODE, date) %>% 
+  # 98% is 15 in Oregon
+  mutate(high_pm_day = ifelse(geo_wt_pm >= 15, 1, 0),
+    smoke_wave = ifelse(lag(high_pm_day, oreder_by = ZIPCODE)==1 & 
+                        high_pm_day==1, 1, 0)) %>% 
+  rename(ZIP = ZIPCODE)
+```
+
+Reading in asthma cohort data for wildfire season and joinin to asthma cohot observations.
+
+```{r read_data}
+read_path <- paste0("../../data/health/",
+  "2013-oregon_asthma_fireseason_cohort.csv")
+
+asthma_cohort <- read_csv(read_path, col_types = cols(.default = "c")) %>% 
+  mutate(date = as.Date(fromdate)) %>% 
+  left_join(pm, by = c("date", "ZIP"))
+```
+
+Find the person with the most observations over this timeperiod.
+
+```{r person_most_obs}
+# create indicator of number of observations
+n_persons <- asthma_cohort %>% 
+  group_by(personkey) %>% 
+  summarise(n_obs = n())
+
+# summary of number of persons
+summary(n_persons)
+
+# plot of distribution
+ggplot(n_persons, aes(x=n_obs)) +
+  geom_density()
+```
+
+92,487 unique personkey IDs, with a range of observations of 444. Most people have a reasonable number of observations over this time.
+
+Some observations are likely multiple lines per claim. 444 visits for a single person (personkey = 10733403) over the 5 month fireseason would be highly unlikely. I want to count up the number of lines per claim per person.
+
+```{r person_claims}
+n_lines <- asthma_cohort %>% 
+  group_by(personkey, clmid) %>% 
+  summarise(n_lines = n())
+
+# summary of number of lines per claim
+summary(n_lines)
+```
+
+There are 265,326 unique claims. Most persons have maybe 1 to 3. One person has a unique claim with 182 (personkey = 10483893) lines associated with it. Distribution plot took too long so I didn't add it. My guess that it would show similar distribution to previous plot.
+
+Now I want to know the number of unique visits per person.
+
+```{r visits_per_person}
+n_visits <- n_lines %>% 
+  group_by(personkey) %>% 
+  summarise(n_visits = n())
+
+# summary of visits
+summary(n_visits)
+
+# density plot
+ggplot(n_visits, aes(x=n_visits)) +
+  geom_density()
+```
+
+Someone had 117 medical claims I'm interpreting as visits/fills over the time period (personkey = 1738926). Most people have 1 or 2 visits.
+
+Now I'd like to know how many medical visits and pharmacy fills.
+
+```{r claims_visits}
+n_visit_types <- asthma_cohort %>% 
+  # group by person and clmid
+  group_by(personkey, clmid) %>% 
+  # filter to first line of clmid
+  arrange(personkey, clmid, line) %>% 
+  # filter to only one claimline 
+  filter(row_number()==1) %>% 
+  # filter again to only asthma as primary or saba
+  filter(visit_type != "dx_asthma_not_primary") %>% 
+  # break initial grouping
+  ungroup() %>% 
+  # remove whitespaces from place of service
+  mutate(pos_simple = stringr::str_replace_all(pos_simple, " ", "")) %>% 
+  # regroup by person and service place
+  group_by(personkey, pos_simple) %>% 
+  # summarise
+  summarise(n_type = n()) %>% 
+  # spread
+  spread(pos_simple, n_type) %>% 
+  mutate_at(vars(Ambulance:UrgentCare), funs(ifelse(is.na(.), 0, .)))
+
+# glipse of first couple lines
+glimpse(n_visit_types)
+
+# summary of overall
+summary(n_visit_types)
+```
+
+67,738 persons. Most people have very few visits for any particular place of service (measure of severity here). I tried a couple plots, but the dataframe was too large and I don't think it will be helpful.
+
+## Wildfire smoke
+
+Adding in a second grouping variable, smoke > 15. Overwritting previous file.
+
+```{r}
+n_visit_types <- asthma_cohort %>% 
+  # group by person and clmid
+  group_by(personkey, clmid) %>% 
+  # filter to first line of clmid
+  arrange(personkey, clmid, line) %>% 
+  # filter to only one claimline 
+  filter(row_number()==1) %>% 
+  # filter again to only asthma as primary or saba
+  filter(visit_type != "dx_asthma_not_primary") %>% 
+  # break initial grouping
+  ungroup() %>% 
+  # remove whitespaces from place of service
+  mutate(pos_simple = stringr::str_replace_all(pos_simple, " ", "")) %>% 
+  # regroup by person and service place
+  group_by(personkey, pos_simple, smoke15) %>% 
+  # summarise
+  summarise(n_type = n()) %>% 
+  # spread
+  spread(pos_simple, n_type) %>% 
+  mutate_at(vars(Ambulance:UrgentCare), funs(ifelse(is.na(.), 0, .)))
+
+
+# checking a person that has two visits
+check <- filter(n_visit_types, personkey == "10001535")
+```
+
+I think rates would be more informative than counts alone. Denominator will be number of days no smoke, and number of days smoke for each ZIP code.
+
+I also would like to extract covariates for each person. I'll do that first.
+
+``` {r covariates}
+# extract vector of ids
+ids <- unique(n_visit_types$personkey)
+
+# extract covariates for each person
+covariates <- asthma_cohort %>%
+  # filter to only persons in id vector
+  filter(personkey %in% ids) %>% 
+  # group by personkey
+  group_by(personkey) %>% 
+  # sort by personkey and date
+  arrange(personkey, date) %>% 
+  # filter first row
+  filter(row_number()==1) %>% 
+  select(personkey, ZIP, gender, age) %>% 
+  ungroup() %>% 
+  mutate(gender = as.factor(gender),
+         age = as.numeric(age))
+```
+
+```{r days_smoke}
+# count up smoke days
+days_smoke <- pm %>% 
+  group_by(ZIP, smoke15) %>% 
+  summarise(n_days=n())
+
+# join smoke days to n_visits_types
+asthma_n_visits <- n_visit_types %>% 
+  # join to covariates
+  left_join(covariates, by = "personkey") %>% 
+  left_join(days_smoke, by = c("ZIP", "smoke15")) %>% 
+  # calculate rates
+  mutate_at(vars(Ambulance:UrgentCare), funs(rate10days = (./n_days)*10)) %>% 
+  # filter out the NAs
+  #need to return to why this might be? zipcoudes outside oregon maybe
+  filter(!is.na(n_days)) %>% 
+  filter(gender != "U")
+
+summary(asthma_n_visits)
+
+glimpse(asthma_n_visits)
+
+```
+
+Generalized Poisson model to see if the counts of ED visits a person might have might be greater on smoke periods compared to non-smoke periods.I adjust for gender and age and account for within subject variability.
+
+```{r poisson_mod}
+lm_mod <- lmer(EmergencyRoomHospital_rate10days ~ smoke15 + (1|personkey) +
+             gender + age, 
+             data = asthma_n_visits)
+
+summary(lm_mod)
+```
+
+### Note for Sheryl: 2018-01-11
+
+Sheryl, is this kind of what you were thinking? I have counts of numbers of times a person was seen for an asthma primary diagnosis by place of service or number of SABA fills (represented by pharmacy).
+
+I could have expanded in different ways, but I think this would have been a huge dataframe. Also, I should note I may be undercounting because I only took the first line of unique claims. 
+
+Next step; find an indicator of smoke >10 or >15? or try smoke wave? Then compare number of visits, or rate by indicator.

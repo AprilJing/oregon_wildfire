@@ -1,0 +1,325 @@
+---
+title: "Asthma Cohort Analytic Epidemiology"
+author: "Ryan Gan"
+date: "12/11/2017"
+output: html_document
+---
+
+### Document Purpose
+
+Descriptive statistics of the assembled asthma cohort. This cohort is made up of all billing records for procedures or pharamacy fills related to cariopulmonary outcomes for anyone in the Oregon APAC data that had been billed for a diagnosis of asthma at any visit in 2013. I have limited the dataframe further to include only asthma related diagnoses claims or SABA fills between May 1, 2013 to September 30, 2013.
+
+```{r setup, echo =F, warning=F, message=F}
+library(tidyverse) # general data wrangle
+library(survival)
+
+# load outcomes vectors
+load("../../data/health/outcome_list.RData")
+# subset asthma and saba vector
+asthma_icd9 <- pluck(outcome_icd9_list, "asthma")
+saba_ndc <- pluck(outcome_icd9_list, "saba")
+
+# knitr options
+knitr::opts_chunk$set(fig.width=8, fig.height=6, fig.path='Figs/',
+                      echo=FALSE, warning=FALSE, message=FALSE)
+```
+
+Read in PM~2.5~ data and create binary smoke variables.
+
+Binary smoke variables are based on the following criteria:
+- Geoweighted smoke is the ZIPCODE population-weighted geoweighted ridge-regression estimate of PM~2.5~, subtracting off the background PM ~2.5~ value (period median without smoke in the column). 
+- Smoke0 through Smoke15 indicators are simply a cutoff value of geo_smoke above 0, 5, 10, and 15 ug/m^3. 
+- Smoke Wave indicators are based on Coco Liu's smoke wave, where I've sent the indicator as two days where population-weighted ZIPCODE PM~2.5~ estimated via geoweighted ridge-regression is above the 98th percentile for Oregon over this period (which is roughly 15 ug/m^3).
+
+I just noticed I haves some negative values in the GWR and Krig values, which cannot happen. Need to check in to this. For now, setting values below 0 to 1. It could have happened during the population-weighting.
+
+```{r pm_import}
+# read in pm2.5 data
+pm_path <- "../../data/pm/2013-oregon_zip_pm25.csv"
+pm <- read_csv(pm_path) %>% 
+  mutate(ZIPCODE = as.character(ZIPCODE),
+    geo_wt_pm = ifelse(geo_wt_pm < 0, 1, geo_wt_pm),
+  # creating binary smoke indicators 
+    smoke0 = ifelse(geo_smk_pm > 0, 1, 0),
+    smoke5 = ifelse(geo_smk_pm > 5, 1, 0),
+    smoke10 = ifelse(geo_smk_pm > 10, 1, 0),
+    smoke15 = ifelse(geo_smk_pm > 15, 1, 0)) %>% 
+  # create smoke wave (98%tile for 2 days) 
+  group_by(ZIPCODE) %>% 
+  arrange(ZIPCODE, date) %>% 
+  # 98% is 15 in Oregon
+  mutate(high_pm_day = ifelse(geo_wt_pm >= 15, 1, 0),
+    smoke_wave = ifelse(lag(high_pm_day, oreder_by = ZIPCODE)==1 & 
+                        high_pm_day==1, 1, 0))
+```
+
+Read in asthma cohort data and join to PM~2.5~ data.
+
+```{r cohort_import}
+# read path
+read_path <- "../../data/health/2013-oregon_asthma_fireseason_cohort.csv"
+# read in asthma cohort (reading a million rows for now)
+asthma_cohort <- read_csv(read_path, col_types = cols(.default = "c")) %>% 
+  mutate(date = as.Date(todate, format = "%Y-%m-%d"),
+         age_cat = case_when(age < 15 ~ "age_15_under",
+                             age >= 15 & age < 65 ~ "age_15to65",
+                             age >= 65 ~ "age_65_over")) %>% 
+  rename(ZIPCODE = ZIP) %>% 
+  left_join(pm, by = c("ZIPCODE", "date"))
+```
+
+### Smoke Distributions
+
+Before I look at associations between smoke PM~2.5~ and outcomes in persons with asthma, I want to understand our PM~2.5~ data.
+
+First thing I want to do is look at the distribution of geoweighted PM~2.5~ by the various smoke indicators. I've log-transformed PM~2.5~ values to fit a log-normal distribution.
+
+#### Plot: GWR PM by smoke classifier distribution
+```{r pm_distribution}
+# small multiples dataframe
+geo_smoke_pm <- pm %>% 
+  select(date, ZIPCODE, geo_wt_pm, smoke0, 
+         smoke5, smoke10, smoke15, smoke_wave) %>% 
+  gather("smoke_classifier", "smoke", smoke0:smoke_wave) %>% 
+  mutate(smoke = as.factor(smoke),
+    smoke_classifier = parse_factor(smoke_classifier, 
+      levels = c("smoke0", "smoke5", "smoke10", "smoke15", "smoke_wave")))
+
+# plot
+ggplot(geo_smoke_pm, aes(x=log(geo_wt_pm), group=smoke, fill=smoke)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~smoke_classifier) +
+  theme_minimal()
+```
+
+It would be great to check these classifiers with areas we know were impacted by smoke to see how accurate each classifier is, but I think it would be fair to say that smoke10, smoke15, and smoke_wave all likely distinguish smoke events with relatively high sensitivity. There could be a whole paper on accuracy of these binary classifiers I think. I have thoughts on how to do this.
+
+### Cross-Sectional Comparison of PM2.5
+
+Before any advanced analyses, I'll take a look at the cross-sectional relationship between PM~2.5~ and potential outcomes.
+
+#### Plot: GWR PM by smoke > 10 ug/m^3 by place of service for asthma as a primary diagnosis
+```{r dist_pos}
+# subset to asthma dx primary
+asthma_primary <- asthma_cohort %>% 
+  # filter to asthma primary and not in a pharmacy
+  filter(visit_type == "dx_asthma_primary" & 
+        !is.na(geo_wt_pm) & pos_simple != "Pharmacy")
+
+# ggplot
+ggplot(asthma_primary, aes(x=log(geo_wt_pm), group=as.factor(smoke10), 
+    fill=as.factor(smoke10))) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~pos_simple) +
+  theme_minimal()
+```
+
+There may be some difference in distributions depending on visit type. For example, ER visit or inpatient hospital visits. 
+
+#### Plot: GWR PM by smoke > 10 ug/m^3 by SABA (all SABA fills are at the pharmacy)
+```{r dist_saba}
+# subset to asthma dx primary
+saba <- asthma_cohort %>% 
+  # filter to asthma primary and not in a pharmacy
+  filter(visit_type == "pharm_saba")
+
+# ggplot
+ggplot(saba, aes(x=log(geo_wt_pm), group=as.factor(smoke10), 
+    fill=as.factor(smoke10))) +
+  geom_density(alpha = 0.5) +
+  theme_minimal()
+```
+
+SABA fills may have different distributions of PM~2.5~ as well. 
+
+```{r saba_pm, eval=F}
+saba_bin <- saba %>% 
+  mutate(bin = cut(geo_wt_pm, breaks = seq(0,220, by = 10)),
+    geo_bin = as.numeric(stringr::str_sub(
+      stringr::str_extract(bin, "[^,]*"), start = 2L))) %>% 
+  group_by(geo_bin) %>% 
+  summarise(n=n()) %>% 
+  mutate(p = n/nrow(saba)) %>% 
+  filter(geo_bin > 10)
+
+
+ggplot(data=saba_bin, aes(x=geo_bin, y=p)) +
+  geom_point()
+# this wasn't a helpful figure (and took too much time)
+```
+
+
+### Time-Stratified Case-Crossover
+
+```{r general functions}
+# function (add to custom package) ----
+# built this package without using dplyr, considering turning this in to a 
+# real r package
+# time stratified function; sets up referent observations
+time.stratified <- function(data, id, covariate=F, admit_date, 
+                            start_date, end_date, interval){
+  # if id value is given
+  if(is.character(id)){
+    # vector of ids
+  id_vec <- data[,id]
+    } else { # else if no value provided, create an id variable
+      id_vec <- seq(1, nrow(data), by=1)
+  }
+  # vector of admit dates joined to the id vector
+  admit_date <- data[,admit_date]
+  id_date <- data.frame(id_vec, admit_date)
+  
+  # create list of vectors of referent dates and admission date
+  referent_date_list <- apply(id_date, 1, function(x){
+    date_prior <- as.character(seq(as.Date(x[2]),as.Date(start_date),
+                                   by = (-interval)))
+    date_posterior <- as.character(seq(as.Date(x[2]),as.Date(end_date),
+                                       by = (interval)))
+    date <- sort(unique(c(date_prior, date_posterior)))
+    identifier <- rep(x[1], length(date))
+    # outcome
+    outcome <- ifelse(date %in% x[2], 1, 0)
+    id_date_vec <- cbind(identifier, date, outcome)
+    return(id_date_vec)
+  }) # end apply
+    # timestrat dataframe
+    ts_data <- do.call(rbind, referent_date_list)
+    rownames(ts_data) <- NULL
+    ts_data <- as.data.frame(ts_data)
+    # if covariates provided, join to the dataframe
+    if(is.character(covariate)){
+      cov_data <- data[,c(id,covariate)]
+      ts_data <- merge(ts_data, cov_data, by.x = "identifier", by.y = id[])
+    }
+  # return dataframe
+  return(ts_data) 
+}
+
+# same day association function
+same_day_fun <- function(data){
+    # fit conditional logistic regression model ----
+  mod <- clogit(outcome ~ geo_smk_pm + wrf_temp + strata(identifier),
+    data = data)
+  # n events
+  n <- mod$nevent
+  # odds ratio
+  estimates <- round(exp(summary(mod)$coefficient[1,1]), 3) 
+  # 95% lower bound
+  lower95 <- round(exp((summary(mod)$coefficient[1,1]) -
+    1.96*(summary(mod)$coefficient[1,3])), 3)
+  # 95% upper bound
+  upper95 <- round(exp((summary(mod)$coefficient[1,1]) +
+    1.96*(summary(mod)$coefficient[1,3])), 3)
+  
+  return_estimate <- data_frame(n,estimates, lower95, upper95) 
+  return(return_estimate) 
+} 
+```
+
+#### Asthma Primary Medical Claims by Place of Service
+
+Same-day associations with asthma place of service outcomes. 
+
+```{r medical_outcome}
+outcome_names <- c("Ambulance", "Emergency Room Hospital",
+                           "Inpatient Hospital", "Urgent Care")
+
+asthma_ts_list <- asthma_primary %>% 
+  filter(pos_simple %in% c("Ambulance", "Emergency Room Hospital",
+                           "Inpatient Hospital", "Urgent Care")) %>% 
+  # split to seperate dataframes
+  split(.$pos_simple) %>% 
+  # filter to one observation per person (first obs)
+  map(function(x) {
+    arrange(x, personkey, date) %>% 
+    group_by(personkey) %>% 
+    # filter to first observation
+    filter(row_number()==1)}) %>% 
+  # create time stratified dataframes  
+  map(~time.stratified(data=.x, id = "personkey", 
+    covariate = c("ZIPCODE", "age_cat", "age", "gender"), 
+    admit_date = "todate", start_date = "2013-05-01", end_date = "2013-09-30",
+    interval = 7) %>% 
+    # convert date to date format
+    mutate(date = as.Date(date),
+         outcome = as.numeric(outcome)-1) %>% 
+    left_join(pm, by = c("ZIPCODE", "date")) %>% 
+    # limit to subjects assigned a smoke value
+    filter(!is.na(geo_wt_pm)) %>% 
+    mutate_at(vars(contains("pm")), funs(./10)))
+
+# apply clogit model
+sameday_results <- asthma_ts_list %>% 
+  map_dfr(~same_day_fun(.)) %>% 
+  bind_cols(., data_frame(outcome_names)) %>% 
+  select(outcome_names, n, estimates, lower95, upper95) %>% 
+  # preserve order of names
+  mutate(outcome_names = parse_factor(outcome_names, levels=outcome_names)) %>%
+  rename(odds_ratio = estimates)
+
+knitr::kable(sameday_results, 
+  caption="Same day association for 10ug/m^3 increase in smoke PM2.5")
+```
+
+#### SABA Fills
+
+SABA fills are a little more complicated as there are a lot more of them, which gives the clogit model some problems. Jingyang had a stack-overflow on the server when trying to run over the same period as the medical outcomes (May to end of September), and I stopped the task since it was clear it would be very slow. This is likely probably how the variance is calculated in clogit. There may be a matrix inversion or something somewhere that makes this an issue.
+
+I think an easy solution is to limit the study period for SABA fills to a shorter period (since we have the sample size) to 2013-07-20 to 2013-08-10, and then to further reduce to just the first fill observation per person during this time period as well. Below I've run two scenarios: each fill by a person in the time period is used, only the first fill during this period is used. In both cases, I consider the person as the strata, so scenario 1 will have multiple observations per person and there could be a case where someone's observed fill date was overwritten by my time-stratified function. The solution to this would be to stratify on each unique fill. I will need to think about this more.
+
+```{r saba_fills}
+# limited period but all obs in that period
+saba_lim_ts <- saba %>% 
+  filter(todate >= "2013-07-20" & todate <= "2013-08-10") %>% 
+  time.stratified(data = ., id="personkey", 
+    covariate = c("ZIPCODE", "age_cat", "age", "gender"), 
+    admit_date = "todate", start_date = "2013-07-20", end_date = "2013-08-10",
+    interval = 7) %>% 
+     mutate(date = as.Date(date),
+         outcome = as.numeric(outcome)-1) %>% 
+    left_join(pm, by = c("ZIPCODE", "date")) %>% 
+    # limit to subjects assigned a smoke value
+    filter(!is.na(geo_wt_pm)) %>% 
+    mutate_at(vars(contains("pm")), funs(./10))
+
+
+# first fill from may to september
+saba_first_fill_ts <- saba %>% 
+    filter(todate >= "2013-07-20" & todate <= "2013-08-10") %>% 
+    arrange(personkey, date) %>% 
+    group_by(personkey) %>% 
+    # filter to first observation
+    filter(row_number()==1) %>%
+  time.stratified(data = ., id="personkey", 
+    covariate = c("ZIPCODE", "age_cat", "age", "gender"), 
+    admit_date = "todate", start_date = "2013-07-20", end_date = "2013-08-10",
+    interval = 7) %>% 
+     mutate(date = as.Date(date),
+         outcome = as.numeric(outcome)-1) %>% 
+    left_join(pm, by = c("ZIPCODE", "date")) %>% 
+    # limit to subjects assigned a smoke value
+    filter(!is.na(geo_wt_pm)) %>% 
+    mutate_at(vars(contains("pm")), funs(./10))
+
+# bind these two ts dataframes in a list
+saba_ts_list <- list(saba_lim_ts, saba_first_fill_ts)
+
+# saba outcome names
+saba_outcomes <- c("SABA all obs", "SABA first obs")
+
+# apply clogit model
+sameday_results <- saba_ts_list %>% 
+  map_dfr(~same_day_fun(.)) %>% 
+  bind_cols(., data_frame(saba_outcomes)) %>% 
+  select(saba_outcomes, n, estimates, lower95, upper95) %>% 
+  # preserve order of names
+  mutate(saba_outcomes = parse_factor(saba_outcomes, levels=saba_outcomes)) %>%
+  rename(odds_ratio = estimates)
+
+knitr::kable(sameday_results, 
+  caption="Same day association for 10ug/m^3 increase in smoke PM2.5")
+```
+
+For both scenarios, there is a signal. The SABA all observation fill is closer to what we found initially. 
+
+We've taken advantage of the Oregon APAC dataset to a greater extent than we have before by considering different outcomes. Somethoughts on the inpatient stay would be how much of an overlap is there with the persons who go to an ER and are then admitted to inpatient? We could figure this out.
