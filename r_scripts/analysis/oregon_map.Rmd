@@ -1,0 +1,158 @@
+---
+title: "Douglas-complex fire smoke and cardiopulmonary morbidity"
+author: "Ryan Gan"
+date: "11/3/2017"
+output: html_document
+---
+
+##1. Introduction
+
+In the summer of 2013, the Douglas-Complex fires occured in southwest Oregon. Oregonians in this part of the state were at risk of exposure to extreme levels of particulate matter (PM). This project aim is to determine if there is an association to smoke from the Douglas-Complex fires and acute cardiopulmonary morbidity in the state of Oregon.
+
+Data came from the Oregon All Payer All Claims Database (APAC) in the year 2013. The APAC records the health care billing data for Oregon's insured populations. APAC include individual billing records for both diagnoses codes (International Classification of Diseases, Clinical Modification (ICD-9-CM) diagnoses codes) and pharmacy codes (National Drug Codes (NDC)). 
+
+Our previous research that found an 
+association with wildfire smoke and respiratory outcomes in Washington state in 2012 wildfire season using a novel estimate of smoke concentration, geographically weighted ridge regression (GWR) guided the methodological approaches used in this project. As Oregon contains pharmacy records, we evaluate the association between smoke and respiratory rescue medications (beta 2 agonists) (abbreviate to SABA). 
+
+*Research question*
+We evaluated the association between smoke concentrations using the GWR method and cardiopulmonary morbidity, including ED/urgent care visits and SABA fills in Oregon state during the 2013 wildfire season.
+
+This markdown document contains the code and results that were used to address this research question.
+
+Packages used: tidyverse, survival.
+```{r setup, echo =F, warning=F, message=F}
+library(tidyverse) # general data wrangle
+library(survival) # conditional logistic regression
+library(geofacet)
+
+# knitr options
+knitr::opts_chunk$set(fig.width=8, fig.height=6, fig.path='Figs/',
+                      echo=FALSE, warning=FALSE, message=FALSE)
+```
+
+
+##2. Wildfire smoke descriptive characteristics
+
+Smoke exposure is represented by ZIP code-level population-weighted PM~2.5~ estimated using geographically-weighted ridge regression (GWR), where we have subtracted off the background median PM~2.5~ for the month where no smoke was present overhead in the atmospheric column using HMS. It was estimated every day for the wildfire season of May to October, 2013.
+
+We've decided to represent descriptive characteristics of smoke by county-level as we can represent the location and temporal variation of smoke exposure better than we could at the ZIP code level.
+
+```{r smoke data import and wrangle}
+# pm path
+pm_path <- paste0("../../data/pm/2013-oregon_county_pm25.csv")
+# county pm
+county_pm_df <- read_csv(pm_path) %>% 
+  mutate(county = stringr::str_replace(county, "[.]", ""))
+
+# fire locations
+fire_locations <- read_csv("../../data/pm/2013-oregon_firelocations.csv") %>% 
+  mutate(area = sqrt(total_acres/1000))
+
+# estimate county smoke 
+county_smk_count <- county_pm_df %>% 
+  # binary smoke variable at >10 ug/m^3
+  mutate(gwr_smk10 = ifelse(geo_smk_pm >= 10, 1, 0)) %>% 
+  group_by(county) %>% 
+  summarise(smk_day10 = sum(gwr_smk10)) %>% 
+  # lower case county name and remove "." to match spatial df
+  mutate(subregion = tolower(stringr::str_replace(county, "[.]", " ")))
+
+# extract oregon map data
+or_county_spatial_df <- map_data("county", "oregon") %>% 
+  right_join(county_smk_count, by = "subregion")
+
+# use the map function from the maps package to get the polygon data
+county_poly <- maps::map("county", "oregon", plot=FALSE, fill = TRUE)
+# find centroids
+county_centroids <- maps:::apply.polygon(county_poly, maps:::centroid.polygon)
+
+# create a data frame for graphing out of the centroids of each polygon
+county_centroids <- county_centroids[!is.na(names(county_centroids))]
+centroid_array <- Reduce(rbind, county_centroids)
+
+county_text <- reduce(county_centroids, rbind) %>% 
+  as_data_frame() %>% 
+  rename(long = V1, lat = V2) %>% 
+  mutate(county = stringr::str_sub(
+    stringr::str_to_title(names(county_centroids)), start=8L)) 
+
+# import msa location file from
+# https://www.statcrunch.com/app/index.php?dataid=1232319
+msa_path <- paste0("../instructions/msa_coordinate.csv")
+msa_df <- read_csv(msa_path) 
+
+msa_location <- msa_df %>%
+  filter(grepl('OR', msa_df$MSA)) %>%
+  filter(MSA != "Albany, OR" &
+         MSA != "Grants Pass, OR")
+
+# create msa label data frame
+msa_text <- msa_location %>%
+  select(MSA, Longitude, Latitude) 
+  
+msa_text$MSA <- gsub(",.*", "", msa_text$MSA)
+```
+
+We summarize smoke exposure two ways: as a count of days where smoke PM~2.5~ is > 10 ug/m^3 (to increase the specificity to identify areas impacted by smoke) at the county level, and time-series of county-population weighted PM~2.5~ over May to October 2013. 
+
+### Number of days in Oregon where smoke PM~2.5~ exceeded 10 ug/m^3. 
+
+```{r smoke days map}
+
+smoke_map <- ggplot(or_county_spatial_df, aes(x=long,y=lat, group=group)) +
+  
+  # fill with number of smoke days
+  geom_polygon(aes(fill =smk_day10)) +
+  scale_fill_gradient2(expression("Smoke Days > 10 µg/m"^3),
+    low = "white", mid= "#00dbde", high="#6a3093", midpoint = 15,
+    guide = guide_colorbar(direction="horizontal", title.position = "top",
+                           title.hjust = 0.5, barwidth = 20)) +
+  # add county path on top
+  geom_path(colour="#4ac29a") +
+  # adding fire locations in
+  geom_point(data=fire_locations, 
+    aes(x=lon, y=lat, size = area,
+    shape = "Fire Locations"), shape = 17, color = "#ff0084", alpha = 0.7,
+    show.legend = FALSE, inherit.aes = FALSE) +
+  # add county text 
+  geom_text(data = county_text, 
+    aes(x=long, y=lat, label = county, group="county"), 
+    colour = "#33001b", size = 2.5) +
+  # add metropolitan
+  geom_point(data=msa_location, 
+    aes(x=Longitude, y=Latitude, size = 1.5,
+    shape = "MSA Locations"), shape = 19, color = "black", alpha = 0.7,
+    show.legend = FALSE, inherit.aes = FALSE) +
+  # add msa text
+  geom_text(data = msa_text, 
+    aes(x=Longitude + c(0.15,0.1,0.1,-0.05,0.2,0.1), y=Latitude + c(0.2,0.1,0.1,-0.1,0.1,0.1), label = MSA, group="MSA"), 
+    colour = "#33001b", size = 2.5) +
+  scale_color_manual(values = c("County" = '#ff0084','MSA' = '#33001b')) + 
+  scale_shape_manual(values = c('County' = 17, 'MSA' = 19)) +
+  
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(panel.background = element_rect(fill = 'white', colour = 'black'),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(colour=NA, fill=NA),
+  legend.position = "bottom") 
+ 
+  
+  # scale_colour_manual(name="Error Bars",values=cols) + 
+  # scale_fill_manual(name="Bar",values=cols)
+
+# scale_fill_manual(name = "Legends",
+#                     values = c("#ff0084", "#33001b"),
+#                     labels = c("County", "MSA"),
+#                     guide = F) +
+
+smoke_map
+
+write_csv(or_county_spatial_df, "./or_county_spatial_df.csv")
+# save figure
+#ggsave(filename = "./smoke_map.png", plot = smoke_map)
+```
+
+Most of the heavy smoke days were in the south-west part of Oregon. Triangles are fires; had them in the legend, but the legend looked weird so I took them out.
+
